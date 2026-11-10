@@ -1,0 +1,9 @@
+node_modules
+data
+.env
+.env.*
+test
+scripts
+*.md
+Dockerfile
+render.yaml

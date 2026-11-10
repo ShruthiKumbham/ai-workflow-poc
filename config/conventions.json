@@ -1,0 +1,45 @@
+{
+  "name": "Sample medallion conventions (reference platform)",
+  "note": "Stand-in conventions until the customer's engineering standards are supplied. All generated SQL is compiled from these rules, not free-typed by the model.",
+  "layers": {
+    "bronze": {
+      "schema": "bronze",
+      "table_pattern": "{system}__{table}",
+      "rules": [
+        "Raw copy of the source table; every source column kept as-is (VARCHAR in, no business logic).",
+        "Add audit columns: _source_system, _source_table, _batch_id, _ingested_at, _record_hash.",
+        "Append-only; one batch id per load."
+      ]
+    },
+    "silver": {
+      "schema": "silver",
+      "table_pattern": "{entity}",
+      "rules": [
+        "snake_case column names; business-friendly names chosen in the mapping.",
+        "Typed columns (DATE, DECIMAL(14,2), INTEGER, VARCHAR) with explicit casts using try_cast / try_strptime.",
+        "De-duplicate on the business key, keeping the latest ingested record.",
+        "Rows failing key or type rules go to {entity}__quarantine with a reject_reason; they never disappear silently.",
+        "PII columns are hashed (sha256) and never stored in clear text.",
+        "Part numbers are standardised and mapped to the product hierarchy; mapping status kept per row.",
+        "Carry lineage columns: _source_system, _batch_id, _record_hash."
+      ]
+    },
+    "gold": {
+      "schema": "gold",
+      "table_pattern": "fct_{subject} | dim_{subject} | rpt_{report}",
+      "rules": [
+        "Facts at the lowest useful grain with conformed dimension attributes (date, product hierarchy, region).",
+        "Measures are registered in the semantic layer (meta.measures) with a definition and a source reconciliation query.",
+        "Report marts (rpt_*) are aggregated at the grain the report needs and are rebuilt from gold facts only."
+      ]
+    }
+  },
+  "data_quality": {
+    "default_checks": ["business key not null", "business key unique", "dates within plausible range", "amounts non-negative", "part mapping rate >= 95%", "quarantine rate <= 5%"],
+    "blocking_severity": "error"
+  },
+  "approval": {
+    "mode": "single-reviewer",
+    "default_reviewer": "Data Steward (POC reviewer)"
+  }
+}

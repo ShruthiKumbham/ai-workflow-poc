@@ -1,0 +1,339 @@
+// Use case 2 - requirement to report.
+// plain-English requirement -> measures/dimensions/period (AI, constrained to the semantic layer)
+// -> plan: reuse existing Gold facts, build missing Gold facts + measures -> report mart
+// -> dry run (dashboard data, reconciliation to source, DQ) -> reviewer approves -> publish.
+import { all, one, run, q, transaction, runScript, tableExists } from './db.js';
+import { structured, SYSTEM_PROMPT, engineInfo } from './llm.js';
+import * as rules from './rules.js';
+import { ALL_MEASURES, BASE_MEASURES, DERIVED_MEASURES, DIMENSIONS, FACTS, baseComponents, factsFor, measureSql, fillDates } from './semantic.js';
+import { listCatalog, registerDataset, addLineage, registerMeasure, saveDqResults, saveReport, audit, newId } from './meta.js';
+
+export async function dataRange() {
+  const r = await one(`SELECT min(order_date)::VARCHAR AS min_d, max(order_date)::VARCHAR AS max_d FROM gold.fct_sales`);
+  return { from: r.min_d, to: r.max_d };
+}
+
+const SPEC_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['title', 'measures', 'dimensions', 'breakdown_dimension', 'date_from', 'date_to', 'chart', 'assumptions'],
+  properties: {
+    title: { type: 'string', description: 'Short report title a business user would recognise' },
+    measures: { type: 'array', items: { type: 'string', enum: Object.keys(ALL_MEASURES) }, description: '1-4 measures, most important first' },
+    dimensions: { type: 'array', items: { type: 'string', enum: Object.keys(DIMENSIONS) }, description: 'Grouping for the main view: at most one time dimension first, then at most one other dimension' },
+    breakdown_dimension: { type: 'string', enum: ['none', ...Object.keys(DIMENSIONS).filter((d) => !DIMENSIONS[d].time)], description: 'Optional secondary breakdown' },
+    date_from: { type: 'string', description: 'YYYY-MM-DD' },
+    date_to: { type: 'string', description: 'YYYY-MM-DD' },
+    chart: { type: 'string', enum: ['line', 'bar'] },
+    assumptions: { type: 'array', items: { type: 'string' } },
+  },
+};
+
+async function factStatus() {
+  const out = {};
+  for (const [name, f] of Object.entries(FACTS)) {
+    const exists = await tableExists(name);
+    let source = null;
+    if (!exists && f.sourceTag) source = await findSilverSource(f);
+    out[name] = { exists, buildable: Boolean(source), source };
+  }
+  return out;
+}
+
+async function findSilverSource(fact) {
+  const cat = await listCatalog();
+  for (const d of cat) {
+    if (d.layer !== 'silver' || d.dataset.endsWith('__quarantine') || !d.tags.includes(fact.sourceTag)) continue;
+    const roles = Object.fromEntries(d.columns.filter((c) => c.role).map((c) => [c.role, c.name]));
+    if (fact.requiresRoles.every((r) => roles[r])) return { dataset: d.dataset, roles, hasHierarchy: d.columns.some((c) => c.name === 'product_line') };
+  }
+  return null;
+}
+
+function specPrompt(text, facts, range) {
+  const measures = Object.values(ALL_MEASURES).map((m) => {
+    const fs = factsFor([m.name]);
+    const avail = fs.every((f) => facts[f].exists || facts[f].buildable);
+    return `- ${m.name}: ${m.label}. ${m.definition}${avail ? '' : ' (UNAVAILABLE: source not onboarded yet)'}`;
+  }).join('\n');
+  const dims = Object.entries(DIMENSIONS).map(([k, d]) => {
+    const inFacts = Object.entries(FACTS).filter(([, f]) => f.dimensions.includes(k)).map(([n]) => n.replace('gold.', ''));
+    return `- ${k}: ${d.label} (available in ${inFacts.join(', ')})`;
+  }).join('\n');
+  return `Business requirement: "${text}"
+
+Break this requirement into a report specification using ONLY the measures and dimensions below.
+Data is available from ${range.from} to ${range.to}. Today is ${new Date().toISOString().slice(0, 10)}.
+If no period is stated, use the last 12 complete months of available data. "Last year" means the last full calendar year in the data.
+A dimension can only be used if it is available in every fact the chosen measures come from.
+Prefer measures marked available; if the request needs an unavailable one, still choose it (the portal will tell the user what to onboard).
+
+Measures:
+${measures}
+
+Dimensions:
+${dims}`;
+}
+
+export function validateSpec(spec, range) {
+  const errors = [];
+  const warnings = [];
+  spec.measures = [...new Set((spec.measures || []).filter((m) => ALL_MEASURES[m]))].slice(0, 4);
+  if (!spec.measures.length) errors.push('no valid measures');
+  spec.dimensions = [...new Set((spec.dimensions || []).filter((d) => DIMENSIONS[d]))];
+  const time = spec.dimensions.filter((d) => DIMENSIONS[d].time);
+  const other = spec.dimensions.filter((d) => !DIMENSIONS[d].time);
+  spec.dimensions = [...time.slice(0, 1), ...other.slice(0, 1)];
+  if (other.length > 1 && (!spec.breakdown_dimension || spec.breakdown_dimension === 'none')) spec.breakdown_dimension = other[1];
+  if (!DIMENSIONS[spec.breakdown_dimension] || spec.dimensions.includes(spec.breakdown_dimension)) spec.breakdown_dimension = 'none';
+  const facts = factsFor(spec.measures);
+  const ok = (d) => facts.every((f) => FACTS[f].dimensions.includes(d));
+  for (const d of [...spec.dimensions]) if (!ok(d)) { warnings.push(`"${DIMENSIONS[d].label}" is not available for ${facts.map((f) => FACTS[f].label).join(' + ')}; dropped.`); spec.dimensions = spec.dimensions.filter((x) => x !== d); }
+  if (spec.breakdown_dimension !== 'none' && !ok(spec.breakdown_dimension)) { warnings.push(`Breakdown "${DIMENSIONS[spec.breakdown_dimension].label}" not available for the chosen measures; dropped.`); spec.breakdown_dimension = 'none'; }
+  if (!spec.dimensions.length) spec.dimensions = ['month'];
+  const isDate = (s) => /^\d{4}-\d{2}-\d{2}$/.test(s || '') && !Number.isNaN(Date.parse(s));
+  if (!isDate(spec.date_from) || !isDate(spec.date_to) || spec.date_from > spec.date_to) errors.push('invalid date range');
+  else {
+    if (spec.date_from < range.from) { spec.date_from = range.from; }
+    if (spec.date_to > range.to) { warnings.push(`Data is only available up to ${range.to}; period truncated.`); spec.date_to = range.to; }
+  }
+  spec.chart = spec.dimensions.some((d) => DIMENSIONS[d].time) ? (spec.chart === 'bar' ? 'bar' : 'line') : 'bar';
+  if (!spec.title) spec.title = spec.measures.map((m) => ALL_MEASURES[m].label).join(', ');
+  return { errors, warnings };
+}
+
+// ---- Gold fact builders ---------------------------------------------------
+function factSql(factName, src) {
+  const r = src.roles;
+  const col = (role, fallback = 'NULL') => (r[role] ? `w.${q(r[role])}` : fallback);
+  const hier = (c) => (src.hasHierarchy ? `coalesce(w.${c}, 'Unmapped')` : `'Unmapped'`);
+  if (factName === 'gold.fct_warranty_claims') {
+    return `-- Gold fact (new): one row per accepted warranty claim, conformed to date, product hierarchy and dealer region
+CREATE OR REPLACE TABLE gold.fct_warranty_claims AS
+SELECT
+  ${col('record_id')} AS claim_id,
+  ${col('event_date')} AS claim_date,
+  dd.year, dd.quarter, dd.month,
+  ${src.hasHierarchy ? 'w.part_no_std' : 'NULL'} AS part_no,
+  ${hier('model_family')} AS model_family,
+  ${hier('product_line')} AS product_line,
+  ${hier('vertical')} AS vertical,
+  ${col('dealer_id')} AS dealer_code,
+  coalesce(d.dealer_name, 'Unknown dealer') AS dealer_name,
+  coalesce(d.region, 'Unknown') AS region,
+  ${col('failure_code')} AS failure_code,
+  coalesce(${col('failure_description')}, 'Not specified') AS failure_mode,
+  ${col('status')} AS claim_status,
+  coalesce(${col('labor_amount', '0')}, 0) AS labor_amount,
+  coalesce(${col('parts_amount', '0')}, 0) AS parts_amount,
+  coalesce(${col('labor_amount', '0')}, 0) + coalesce(${col('parts_amount', '0')}, 0) AS total_claim_amount
+FROM ${src.dataset} w
+JOIN gold.dim_date dd ON dd.date = ${col('event_date')}
+LEFT JOIN silver.dealers d ON d.dealer_code = ${col('dealer_id')}
+WHERE upper(coalesce(${col('status', "''")}, '')) <> 'REJECTED';`;
+  }
+  if (factName === 'gold.fct_quality_inspections') {
+    const ts = col('event_timestamp');
+    return `-- Gold fact (new): one row per end-of-line inspection, conformed to date and product hierarchy
+CREATE OR REPLACE TABLE gold.fct_quality_inspections AS
+SELECT
+  ${col('record_id')} AS inspection_id,
+  ${ts}::DATE AS inspection_date,
+  dd.year, dd.quarter, dd.month,
+  ${src.hasHierarchy ? 'w.part_no_std' : 'NULL'} AS part_no,
+  ${hier('model_family')} AS model_family,
+  ${hier('product_line')} AS product_line,
+  ${hier('vertical')} AS vertical,
+  coalesce(${col('plant_code')}, 'Unknown') AS plant_code,
+  coalesce(${col('test_type')}, 'Unknown') AS check_type,
+  upper(${col('test_result')}) AS test_result,
+  ${col('measured_value')} AS measured_value
+FROM ${src.dataset} w
+JOIN gold.dim_date dd ON dd.date = ${ts}::DATE;`;
+  }
+  throw new Error(`No builder for ${factName}`);
+}
+
+function slug(s) {
+  return s.toLowerCase().replace(/\(.*?\)/g, '').replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '').split('_').slice(0, 6).join('_').slice(0, 40) || 'report';
+}
+
+function martSql(table, spec) {
+  const dims = [...spec.dimensions, ...(spec.breakdown_dimension !== 'none' ? [spec.breakdown_dimension] : [])];
+  const bases = [...new Set(spec.measures.flatMap(baseComponents))];
+  const facts = [...new Set(bases.map((b) => BASE_MEASURES[b].fact))];
+  const ctes = facts.map((f, i) => {
+    const ms = bases.filter((b) => BASE_MEASURES[b].fact === f).map((b) => `${BASE_MEASURES[b].expression} AS ${b}`);
+    return `  f${i} AS (\n    SELECT ${dims.join(', ')}, ${ms.join(', ')}\n    FROM ${f}\n    WHERE ${FACTS[f].dateColumn} BETWEEN DATE '${spec.date_from}' AND DATE '${spec.date_to}'\n    GROUP BY ALL\n  )`;
+  });
+  let select;
+  if (facts.length === 1) {
+    select = `SELECT * FROM f0`;
+  } else {
+    const dimCols = dims.map((d) => `coalesce(${facts.map((_, i) => `f${i}.${d}`).join(', ')}) AS ${d}`);
+    const mCols = bases.map((b) => `coalesce(f${facts.indexOf(BASE_MEASURES[b].fact)}.${b}, 0) AS ${b}`);
+    // Measures come from at most two facts today (e.g. warranty + sales for claim rate).
+    select = `SELECT\n  ${[...dimCols, ...mCols].join(',\n  ')}\nFROM f0\n${facts.slice(1).map((_, i) => `FULL OUTER JOIN f${i + 1} ON ${dims.map((d) => `f${i + 1}.${d} IS NOT DISTINCT FROM f0.${d}`).join(' AND ')}`).join('\n')}`;
+  }
+  return `-- Gold report mart (new): ${spec.title}
+-- Grain: ${dims.join(' x ')}; base measures: ${bases.join(', ')}; period ${spec.date_from} .. ${spec.date_to}
+CREATE OR REPLACE TABLE ${table} AS
+WITH
+${ctes.join(',\n')}
+${select};`;
+}
+
+// ---- dashboard data & reconciliation -------------------------------------
+export async function reportData(spec, table) {
+  const ms = spec.measures;
+  const sel = ms.map((m) => `${measureSql(m)} AS ${m}`).join(', ');
+  const kpiRow = await one(`SELECT ${sel} FROM ${table}`);
+  const kpis = ms.map((m) => ({ name: m, label: ALL_MEASURES[m].label, format: ALL_MEASURES[m].format, value: kpiRow[m] }));
+  const timeDim = spec.dimensions.find((d) => DIMENSIONS[d].time);
+  const catDim = spec.dimensions.find((d) => !DIMENSIONS[d].time);
+  const out = { kpis, measures: ms.map((m) => ({ name: m, label: ALL_MEASURES[m].label, format: ALL_MEASURES[m].format })) };
+  if (timeDim) {
+    out.time = { dim: timeDim, series_dim: catDim || null, rows: await all(`SELECT ${timeDim} AS t, ${catDim ? `${catDim} AS s` : `'Total' AS s`}, ${sel} FROM ${table} GROUP BY ALL ORDER BY 1, 2`) };
+  }
+  const bd = spec.breakdown_dimension !== 'none' ? spec.breakdown_dimension : catDim;
+  if (bd) out.breakdown = { dim: bd, rows: await all(`SELECT ${bd} AS k, ${sel} FROM ${table} GROUP BY ALL ORDER BY ${ms[0]} DESC NULLS LAST`) };
+  const dims = [...spec.dimensions, ...(spec.breakdown_dimension !== 'none' ? [spec.breakdown_dimension] : [])];
+  out.table = { columns: [...dims, ...ms], rows: await all(`SELECT ${dims.join(', ')}, ${sel} FROM ${table} GROUP BY ALL ORDER BY ${dims.map((_, i) => i + 1).join(', ')} LIMIT 400`) };
+  return out;
+}
+
+export async function reconcile(spec, table) {
+  const bases = [...new Set(spec.measures.flatMap(baseComponents))];
+  const lines = [];
+  for (const b of bases) {
+    const m = BASE_MEASURES[b];
+    const report = (await one(`SELECT sum(${b})::DOUBLE AS v FROM ${table}`)).v ?? 0;
+    const gold = (await one(`SELECT (${m.expression})::DOUBLE AS v FROM ${m.fact} WHERE ${FACTS[m.fact].dateColumn} BETWEEN DATE '${spec.date_from}' AND DATE '${spec.date_to}'`)).v ?? 0;
+    const source = (await one(fillDates(m.sourceCheck, spec.date_from, spec.date_to))).v ?? 0;
+    const src = Number(source);
+    const tol = m.format === 'int' ? 0 : 0.01;
+    const diff = Number(report) - src;
+    lines.push({ measure: b, label: m.label, format: m.format, source: src, gold: Number(gold), report: Number(report), difference: Math.round(diff * 100) / 100, passed: Math.abs(diff) <= tol, rule: m.definition });
+  }
+  return { tolerance: 'exact for counts, +/- 0.01 for amounts', passed: lines.every((l) => l.passed), lines, period: [spec.date_from, spec.date_to] };
+}
+
+async function martChecks(table, spec, newFacts) {
+  const dims = [...spec.dimensions, ...(spec.breakdown_dimension !== 'none' ? [spec.breakdown_dimension] : [])];
+  const out = [];
+  const rows = (await one(`SELECT count(*) AS n FROM ${table}`)).n;
+  out.push({ dataset: table, name: 'Report mart is not empty', severity: 'error', failed: rows ? 0 : 1, total: rows, threshold: '> 0 rows', passed: rows > 0, detail: `${rows} rows` });
+  const nulls = (await one(`SELECT count(*) AS n FROM ${table} WHERE ${dims.map((d) => `${d} IS NULL`).join(' OR ')}`)).n;
+  out.push({ dataset: table, name: 'No null dimension values', severity: 'warning', failed: nulls, total: rows, threshold: '0', passed: nulls === 0, detail: '' });
+  for (const f of newFacts) {
+    const n = (await one(`SELECT count(*) AS n FROM ${f}`)).n;
+    const k = (await one(`SELECT count(*) - count(DISTINCT ${f === 'gold.fct_warranty_claims' ? 'claim_id' : 'inspection_id'}) AS n FROM ${f}`)).n;
+    out.push({ dataset: f, name: 'Fact grain is unique', severity: 'error', failed: k, total: n, threshold: '0', passed: k === 0, detail: `${n} rows` });
+    const unm = (await one(`SELECT count(*) AS n FROM ${f} WHERE product_line = 'Unmapped'`)).n;
+    out.push({ dataset: f, name: 'Rows with unmapped product line', severity: 'warning', failed: unm, total: n, threshold: '<= 5%', passed: n ? unm / n <= 0.05 : true, detail: n ? `${((unm / n) * 100).toFixed(1)}% shown as "Unmapped" so totals still reconcile` : '' });
+  }
+  return out;
+}
+
+// ---- propose ---------------------------------------------------------------
+export async function proposeReport({ requestText }) {
+  const notes = [];
+  const range = await dataRange();
+  const facts = await factStatus();
+  let spec = null;
+  let engine = 'rules';
+  const ai = await structured({ system: SYSTEM_PROMPT, prompt: specPrompt(requestText, facts, range), schema: SPEC_SCHEMA });
+  let warnings = [];
+  if (ai.ok) {
+    const v = validateSpec(ai.data, range);
+    if (v.errors.length) notes.push({ step: 'Requirement breakdown', engine: 'claude', note: `Claude spec rejected: ${v.errors.join('; ')}. Fell back to rule engine.` });
+    else { spec = ai.data; engine = 'claude'; warnings = v.warnings; notes.push({ step: 'Requirement breakdown', engine: 'claude', note: `Broken down by ${engineInfo().label}; passed validation.` }); }
+  } else if (engineInfo().mode === 'claude') {
+    notes.push({ step: 'Requirement breakdown', engine: 'claude', note: `Claude unavailable (${ai.error}); used rule engine.` });
+  }
+  if (!spec) {
+    spec = rules.decomposeRequirement(requestText, { dataEnd: range.to });
+    const v = validateSpec(spec, range);
+    if (v.errors.length) throw new Error(`Could not interpret the requirement: ${v.errors.join('; ')}`);
+    warnings = v.warnings;
+    notes.push({ step: 'Requirement breakdown', engine: 'rules', note: 'Broken down by rule-based glossary matcher.' });
+  }
+
+  // Plan: reuse / build / blocked
+  const needed = factsFor(spec.measures);
+  const plan = { reuse: [], build: [], blocked: [] };
+  for (const f of needed) {
+    if (facts[f].exists) plan.reuse.push(f);
+    else if (facts[f].buildable) plan.build.push({ fact: f, from: facts[f].source.dataset });
+    else plan.blocked.push(f);
+  }
+  if (plan.blocked.length) {
+    const what = plan.blocked.map((f) => FACTS[f]).map((f) => (f.subject === 'warranty' ? 'warranty claims (src_dealer.warranty_claims)' : f.subject === 'inspection' ? 'quality inspections (src_mes.quality_inspections)' : f.label));
+    return { blocked: true, spec, message: `This report needs ${what.join(' and ')}, which ${what.length > 1 ? 'are' : 'is'} not on the platform in Silver yet. Ask a data engineer to onboard it first, e.g. "Onboard ${what[0].replace(/.*\((.*)\)/, '$1')}".`, notes };
+  }
+  const registered = new Set((await all(`SELECT name FROM meta.measures`)).map((r) => r.name));
+  const allMeasureNames = [...new Set([...spec.measures, ...spec.measures.flatMap(baseComponents)])];
+  const measuresNew = allMeasureNames.filter((m) => !registered.has(m)).map((m) => ALL_MEASURES[m]);
+  const measuresReused = allMeasureNames.filter((m) => registered.has(m));
+
+  let table = `gold.rpt_${slug(spec.title)}`;
+  if (await tableExists(table)) table = `${table}_${Math.random().toString(36).slice(2, 6)}`;
+  const sql = { facts: Object.fromEntries(plan.build.map((b) => [b.fact, factSql(b.fact, facts[b.fact].source)])), mart: martSql(table, spec) };
+  notes.push({ step: 'Plan', engine: 'deterministic', note: `Reuse ${plan.reuse.length ? plan.reuse.join(', ') : 'none'}; build ${plan.build.length ? plan.build.map((b) => b.fact).join(', ') : 'no new facts'}; mart ${table}.` });
+
+  const preview = await transaction(async () => {
+    for (const s of Object.values(sql.facts)) await runScript(s);
+    await runScript(sql.mart);
+    const data = await reportData(spec, table);
+    const reconciliation = await reconcile(spec, table);
+    const checks = await martChecks(table, spec, plan.build.map((b) => b.fact));
+    return { data, reconciliation, checks };
+  }, { commit: false });
+  notes.push({ step: 'Dry run', engine: 'deterministic', note: `Report built in a rolled-back transaction; reconciliation ${preview.reconciliation.passed ? 'passed' : 'FAILED'}.` });
+
+  const summary = `${spec.measures.length} measure(s) x ${[...spec.dimensions, spec.breakdown_dimension].filter((d) => d && d !== 'none').length} dimension(s), ${spec.date_from} .. ${spec.date_to}. Reuses ${plan.reuse.length} Gold table(s), builds ${plan.build.length} new fact(s) + 1 report mart, registers ${measuresNew.length} new measure(s). Reconciliation to source: ${preview.reconciliation.passed ? 'passed' : 'FAILED'}.`;
+  return {
+    blocked: false,
+    title: spec.title, summary, engine,
+    payload: { request_text: requestText, spec, warnings, plan, table, sql, measures_new: measuresNew, measures_reused: measuresReused, preview, notes },
+  };
+}
+
+// ---- deploy ------------------------------------------------------------------
+export async function deployReport(artifact, { reviewer }) {
+  const p = artifact.payload;
+  const { spec, table, plan } = p;
+  const result = await transaction(async () => {
+    for (const s of Object.values(p.sql.facts)) await runScript(s);
+    await runScript(p.sql.mart);
+    const reconciliation = await reconcile(spec, table);
+    const checks = await martChecks(table, spec, plan.build.map((b) => b.fact));
+    const blocking = checks.filter((c) => c.severity === 'error' && !c.passed);
+    if (blocking.length) throw new Error(`Blocking checks failed: ${blocking.map((b) => b.name).join('; ')}`);
+    return { reconciliation, checks };
+  }, { commit: true });
+
+  const cols = async (t) => {
+    const [s, n] = t.split('.');
+    return all(`SELECT column_name AS name, data_type AS type FROM information_schema.columns WHERE table_schema = ? AND table_name = ? ORDER BY ordinal_position`, [s, n]);
+  };
+  for (const b of plan.build) {
+    const f = FACTS[b.fact];
+    await registerDataset({ dataset: b.fact, layer: 'gold', title: f.label, description: `Built by the portal from ${b.from} for "${spec.title}".`, owner: reviewer, sourceSystem: b.from.split('.')[1], columns: await cols(b.fact), rowCount: (await one(`SELECT count(*) AS n FROM ${b.fact}`)).n, tags: ['fact', f.subject, 'built by portal'], artifactId: artifact.id, dqStatus: 'passed' });
+    await addLineage(b.from, b.fact, 'fact build', artifact.id);
+    await addLineage('gold.dim_date', b.fact, 'join', artifact.id);
+    if (b.fact === 'gold.fct_warranty_claims') await addLineage('silver.dealers', b.fact, 'dealer region', artifact.id);
+  }
+  await registerDataset({ dataset: table, layer: 'gold', title: `Report mart: ${spec.title}`, description: `Aggregated at ${[...spec.dimensions, spec.breakdown_dimension].filter((d) => d !== 'none').join(' x ')} for ${spec.date_from}..${spec.date_to}.`, owner: reviewer, sourceSystem: 'derived', columns: await cols(table), rowCount: (await one(`SELECT count(*) AS n FROM ${table}`)).n, tags: ['report mart'], artifactId: artifact.id, dqStatus: result.checks.every((c) => c.passed) ? 'passed' : 'passed with warnings' });
+  for (const f of factsFor(spec.measures)) await addLineage(f, table, 'aggregate', artifact.id);
+  for (const m of p.measures_new) await registerMeasure(m, artifact.id);
+
+  const reportId = newId('DSH');
+  await addLineage(table, `report:${reportId}`, 'dashboard + PDF', artifact.id);
+  await saveReport({ id: reportId, title: spec.title, artifactId: artifact.id, dataset: table, spec, reconciliation: result.reconciliation });
+  await saveDqResults(artifact.id, 'deploy', result.checks);
+  await audit(reviewer, 'report.published', reportId, spec.title);
+  return { reportId, table, reconciliation: result.reconciliation };
+}
+
+export { DERIVED_MEASURES };

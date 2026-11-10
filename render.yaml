@@ -1,0 +1,17 @@
+# Render Blueprint: New > Blueprint, pick this repo, then fill in the secret values.
+services:
+  - type: web
+    name: ai-workflow-poc
+    runtime: docker
+    plan: free
+    region: oregon
+    healthCheckPath: /healthz
+    envVars:
+      - key: AI_ENGINE
+        value: rules          # change to auto once a funded Claude API key is set
+      - key: PORTAL_USER
+        value: demo
+      - key: PORTAL_PASSWORD
+        sync: false           # Render asks you for this value; never commit it
+      - key: ANTHROPIC_API_KEY
+        sync: false           # optional; leave blank to stay on the rules engine
