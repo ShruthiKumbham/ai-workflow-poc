@@ -60,9 +60,20 @@ export const FACTS = {
 
 const rng = (col) => `${col} BETWEEN {{date_from}} AND {{date_to}}`;
 const num = (c) => `coalesce(try_cast(replace(trim(${c}), ',', '') AS DECIMAL(14,2)), 0)`;
-const WARRANTY_SRC = `(SELECT DISTINCT ON (CLAIM_NO) *, try_strptime(trim(CLAIM_DT), '%m/%d/%Y')::DATE AS _d FROM src_dealer.warranty_claims
+// The warranty source check follows the layer rules the claims were onboarded with
+// (which statuses reach Gold, whether negative amounts are quarantined), so reconciliation
+// always compares like with like. Without rules it uses the platform default (exclude REJECTED).
+const sqlStr = (v) => `'${String(v).replace(/'/g, "''")}'`;
+const WARRANTY_SRC = (r = {}) => {
+  const st = r.statuses;
+  const statusCond = Array.isArray(st)
+    ? (st.length ? `upper(trim(coalesce(CLAIM_STATUS, ''))) IN (${st.map(sqlStr).join(', ')})` : 'false')
+    : `upper(trim(coalesce(CLAIM_STATUS, ''))) <> 'REJECTED'`;
+  const neg = r.excludeNegative ? ` AND ${num('LABOR_AMT')} >= 0 AND ${num('PARTS_AMT')} >= 0` : '';
+  return `(SELECT DISTINCT ON (CLAIM_NO) *, try_strptime(trim(CLAIM_DT), '%m/%d/%Y')::DATE AS _d FROM src_dealer.warranty_claims
   WHERE nullif(trim(CLAIM_NO), '') IS NOT NULL AND try_strptime(trim(CLAIM_DT), '%m/%d/%Y') IS NOT NULL) w
-  WHERE upper(trim(coalesce(CLAIM_STATUS, ''))) <> 'REJECTED' AND ${rng('_d')}`;
+  WHERE ${statusCond}${neg} AND ${rng('_d')}`;
+};
 const INSPECTION_SRC = `(SELECT DISTINCT ON (INSP_ID) *, try_cast(INSP_TS AS TIMESTAMP)::DATE AS _d FROM src_mes.quality_inspections
   WHERE nullif(trim(INSP_ID), '') IS NOT NULL AND try_cast(INSP_TS AS TIMESTAMP) IS NOT NULL) i WHERE ${rng('_d')}`;
 
@@ -89,27 +100,27 @@ export const BASE_MEASURES = {
   },
   warranty_cost: {
     name: 'warranty_cost', label: 'Warranty cost', kind: 'base', fact: 'gold.fct_warranty_claims', expression: 'sum(total_claim_amount)', format: 'usd',
-    definition: 'Labor + parts amount on warranty claims, de-duplicated by claim number, excluding REJECTED claims.',
+    definition: 'Labor + parts amount on warranty claims, de-duplicated by claim number, for the claim statuses included in Gold (default: all except REJECTED).',
     synonyms: ['warranty cost', 'warranty spend', 'claim cost', 'warranty expense', 'claims cost', 'warranty'],
-    sourceCheck: `SELECT sum(${num('LABOR_AMT')} + ${num('PARTS_AMT')}) AS v FROM ${WARRANTY_SRC}`,
+    sourceCheck: (ctx = {}) => `SELECT sum(${num('LABOR_AMT')} + ${num('PARTS_AMT')}) AS v FROM ${WARRANTY_SRC(ctx.warranty)}`,
   },
   claim_count: {
     name: 'claim_count', label: 'Warranty claims', kind: 'base', fact: 'gold.fct_warranty_claims', expression: 'count(*)', format: 'int',
-    definition: 'Number of warranty claims, de-duplicated, excluding REJECTED.',
+    definition: 'Number of warranty claims, de-duplicated, for the claim statuses included in Gold (default: all except REJECTED).',
     synonyms: ['claims', 'claim count', 'number of claims', 'warranty claims'],
-    sourceCheck: `SELECT count(*) AS v FROM ${WARRANTY_SRC}`,
+    sourceCheck: (ctx = {}) => `SELECT count(*) AS v FROM ${WARRANTY_SRC(ctx.warranty)}`,
   },
   labor_cost: {
     name: 'labor_cost', label: 'Warranty labor cost', kind: 'base', fact: 'gold.fct_warranty_claims', expression: 'sum(labor_amount)', format: 'usd',
     definition: 'Labor amount on warranty claims (same claim rules as warranty cost).',
     synonyms: ['labor cost', 'labour cost'],
-    sourceCheck: `SELECT sum(${num('LABOR_AMT')}) AS v FROM ${WARRANTY_SRC}`,
+    sourceCheck: (ctx = {}) => `SELECT sum(${num('LABOR_AMT')}) AS v FROM ${WARRANTY_SRC(ctx.warranty)}`,
   },
   parts_cost: {
     name: 'parts_cost', label: 'Warranty parts cost', kind: 'base', fact: 'gold.fct_warranty_claims', expression: 'sum(parts_amount)', format: 'usd',
     definition: 'Parts amount on warranty claims (same claim rules as warranty cost).',
     synonyms: ['parts cost'],
-    sourceCheck: `SELECT sum(${num('PARTS_AMT')}) AS v FROM ${WARRANTY_SRC}`,
+    sourceCheck: (ctx = {}) => `SELECT sum(${num('PARTS_AMT')}) AS v FROM ${WARRANTY_SRC(ctx.warranty)}`,
   },
   inspections: {
     name: 'inspections', label: 'Inspections', kind: 'base', fact: 'gold.fct_quality_inspections', expression: 'count(*)', format: 'int',

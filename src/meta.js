@@ -34,6 +34,8 @@ CREATE TABLE IF NOT EXISTS meta.alerts (
 CREATE TABLE IF NOT EXISTS meta.part_exceptions (
   artifact_id VARCHAR, dataset VARCHAR, raw_value VARCHAR, normalized VARCHAR, reason VARCHAR,
   suggestion VARCHAR, row_count BIGINT);
+CREATE TABLE IF NOT EXISTS meta.layer_rules (
+  dataset VARCHAR PRIMARY KEY, rules VARCHAR, artifact_id VARCHAR, updated_at TIMESTAMP);
 CREATE TABLE IF NOT EXISTS meta.audit (
   ts TIMESTAMP, actor VARCHAR, action VARCHAR, object VARCHAR, detail VARCHAR);
 `;
@@ -142,6 +144,17 @@ export async function lineageGraph(node) {
   walk('down');
   const sub = edges.filter((e) => keep.has(e.from_node) && keep.has(e.to_node));
   return { nodes: [...keep], edges: sub };
+}
+
+// ---- layer rules (Bronze/Silver/Gold rules a reviewer agreed to) ---------
+export async function saveLayerRules(dataset, rules, artifactId = null) {
+  await run(`DELETE FROM meta.layer_rules WHERE dataset = ?`, [dataset]);
+  await run(`INSERT INTO meta.layer_rules VALUES (?, ?, ?, now())`, [dataset, JSON.stringify(rules), artifactId]);
+}
+
+export async function getLayerRules(dataset) {
+  const r = await one(`SELECT rules FROM meta.layer_rules WHERE dataset = ?`, [dataset]);
+  return r ? parse(r.rules, null) : null;
 }
 
 // ---- data quality ---------------------------------------------------------

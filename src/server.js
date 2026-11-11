@@ -4,11 +4,14 @@ import path from 'node:path';
 import fs from 'node:fs';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
-import { connect, exclusive, all, one, q, tableExists } from './db.js';
+import { connect, exclusive, all, one, q, tableExists, runScript } from './db.js';
 import { engineInfo } from './llm.js';
 import { seed } from './seed.js';
 import { listSources } from './profiler.js';
-import { intake, decide } from './workflow.js';
+import { intake, decide, revise } from './workflow.js';
+import { ROLES, TRANSFORMS, DIMENSIONS, ALL_MEASURES, BASE_MEASURES, FACTS } from './semantic.js';
+import { LOAD_MODES } from './onboarding.js';
+import { CHARTS, LAYOUTS } from './reporting.js';
 import { reportData, dataRange } from './reporting.js';
 import { evaluateAlert } from './alerts.js';
 import { renderReportPdf } from './pdf.js';
@@ -31,6 +34,7 @@ export async function ensureSeeded() {
   await connect();
   const ok = await exclusive(() => tableExists('meta.catalog'));
   if (!ok) await seed({ quiet: true });
+  else await exclusive(() => runScript(meta.META_DDL)); // adds any meta tables introduced since the DB was seeded
 }
 
 const LAYER_ORDER = ['src_', 'bronze.', 'silver.', 'gold.', 'report:'];
@@ -105,6 +109,17 @@ export function createApp() {
   app.post('/api/artifacts/:id/decision', h((req) => decide(req.params.id, {
     decision: req.body?.decision, reviewer: String(req.body?.reviewer || '').trim(), comment: req.body?.comment || '', acceptSuggestions: Boolean(req.body?.acceptSuggestions),
   })));
+
+  app.post('/api/artifacts/:id/revise', h((req) => revise(req.params.id, {
+    reviewer: String(req.body?.reviewer || '').trim(), comment: String(req.body?.comment || ''), edits: req.body?.edits || {},
+  })));
+  // Vocabulary the review screen offers as choices (same lists the AI and validators use).
+  app.get('/api/vocabulary', (req, res) => res.json({
+    roles: ROLES, transforms: Object.fromEntries(Object.entries(TRANSFORMS).map(([k, v]) => [k, v.label])), load_modes: LOAD_MODES, charts: CHARTS, layouts: LAYOUTS,
+    dimensions: Object.fromEntries(Object.entries(DIMENSIONS).map(([k, v]) => [k, { label: v.label, time: Boolean(v.time) }])),
+    measures: Object.fromEntries(Object.values(ALL_MEASURES).map((m) => [m.name, { label: m.label, kind: m.kind, fact: m.kind === 'base' ? m.fact : (BASE_MEASURES[m.numerator].fact === BASE_MEASURES[m.denominator].fact ? BASE_MEASURES[m.numerator].fact : null) }])),
+    fact_dimensions: Object.fromEntries(Object.entries(FACTS).map(([k, v]) => [k, v.dimensions])),
+  }));
 
   app.get('/api/catalog', read(() => meta.listCatalog()));
   app.get('/api/catalog/:dataset', read(async (req) => {

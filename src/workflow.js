@@ -5,9 +5,9 @@ import { exclusive } from './db.js';
 import { structured, SYSTEM_PROMPT, engineInfo } from './llm.js';
 import * as rules from './rules.js';
 import { listSources } from './profiler.js';
-import { proposeOnboarding, deployOnboarding } from './onboarding.js';
-import { proposeReport, deployReport } from './reporting.js';
-import { proposeAlert, deployAlert } from './alerts.js';
+import { proposeOnboarding, deployOnboarding, reviseOnboarding } from './onboarding.js';
+import { proposeReport, deployReport, reviseReport } from './reporting.js';
+import { proposeAlert, deployAlert, reviseAlert } from './alerts.js';
 import { createRequest, updateRequest, createArtifact, getArtifact, setArtifactStatus, audit } from './meta.js';
 
 const ENGINE_LABEL = (e) => (e === 'claude' ? engineInfo().label : 'Rule-based engine');
@@ -102,5 +102,33 @@ export async function decide(artifactId, { decision, reviewer, comment, acceptSu
       await audit(reviewer, 'artifact.deploy_failed', artifactId, err.message);
       throw Object.assign(new Error(`Deployment failed and was rolled back: ${err.message}`), { status: 500 });
     }
+  });
+}
+
+// Request changes: the reviewer's edits and comment produce a new version of the proposal,
+// regenerated and dry-run again. The previous version is kept as "superseded" for the audit trail.
+export async function revise(artifactId, { reviewer, comment = '', edits = {} }) {
+  return exclusive(async () => {
+    const a = await getArtifact(artifactId);
+    if (!a) throw Object.assign(new Error('Artifact not found'), { status: 404 });
+    if (a.status !== 'pending_review') throw Object.assign(new Error(`Artifact is ${a.status}, not pending review`), { status: 409 });
+    if (!reviewer) throw Object.assign(new Error('Reviewer name is required'), { status: 400 });
+    const hasEdits = edits && Object.keys(edits).length > 0;
+    if (!comment.trim() && !hasEdits) throw Object.assign(new Error('Describe the change in the comment box, or edit the proposal on the review screen'), { status: 400 });
+
+    const reviser = { onboarding: reviseOnboarding, report: reviseReport, alert: reviseAlert }[a.kind];
+    const proposal = await reviser(a.payload, { edits, comment });
+    const prev = a.payload.revision || { version: 1, history: [] };
+    const version = prev.version + 1;
+    const history = [...(prev.history || []), { version: prev.version, artifact_id: a.id, requested_by: reviewer, comment, changes: proposal.changes, at: new Date().toISOString() }];
+    proposal.payload.revision = { version, parent_id: a.id, requested_by: reviewer, comment, changes: proposal.changes, not_applied: proposal.notApplied || [], history };
+    proposal.payload.notes.unshift({ step: 'Request changes', engine: 'deterministic', note: `Version ${version}, requested by ${reviewer}${comment ? `: "${comment}"` : ''}` });
+
+    const newId = await createArtifact({ requestId: a.request_id, kind: a.kind, title: proposal.title, engine: ENGINE_LABEL(proposal.engine), summary: proposal.summary, payload: proposal.payload });
+    await setArtifactStatus(artifactId, 'superseded', { reviewer, comment: `Changes requested → ${newId}${comment ? `: ${comment}` : ''}` });
+    const msg = `Changes requested by ${reviewer}; version ${version} (${newId}) is waiting for review.`;
+    await updateRequest(a.request_id, { status: 'pending_review', artifact_id: newId, message: msg });
+    await audit(reviewer, 'artifact.changes_requested', artifactId, `${comment || 'edited on review screen'} → ${newId}`);
+    return { status: 'revised', artifactId: newId, version, changes: proposal.changes, notApplied: proposal.notApplied || [], message: msg };
   });
 }

@@ -45,7 +45,7 @@ test('UC1: onboarding request produces a reviewable artifact; nothing is live ye
   assert.equal(roles.CLAIM_NO, 'record_id');
   assert.equal(roles.PART_NUM, 'part_number');
   assert.equal(roles.CUST_EMAIL, 'contact_email');
-  assert.match(a.payload.sql.bronze, /CREATE OR REPLACE TABLE bronze\.dealer__warranty_claims/);
+  assert.match(a.payload.sql.bronze, /CREATE TABLE IF NOT EXISTS bronze\.dealer__warranty_claims/);
   assert.match(a.payload.sql.silver, /silver\.product_hierarchy/);
   assert.ok(a.payload.preview.checks.every((c) => c.severity !== 'error' || c.passed), 'blocking checks pass in dry run');
   assert.ok(a.payload.preview.exceptions.some((e) => e.suggestion), 'near-match part exceptions are suggested');

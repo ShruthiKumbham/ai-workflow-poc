@@ -56,10 +56,15 @@ export function renderReportPdf({ report, data, approval }) {
   const chartH = 250;
   const head = data.measures[0];
   doc.fillColor(INK).font('Helvetica-Bold').fontSize(10);
-  if (data.time) {
+  const chart = spec.chart || 'line';
+  if (chart === 'table') {
+    doc.text('Detail', M, y);
+    drawDetailTable(doc, data, M, y + 16, chartW, chartH - 16);
+  } else if (data.time) {
     const dimLabel = DIMENSIONS[data.time.dim].label.toLowerCase();
     doc.text(`${head.label} by ${dimLabel}${data.time.series_dim ? ` and ${DIMENSIONS[data.time.series_dim].label.toLowerCase()}` : ''}`, M, y);
-    drawLineChart(doc, data.time.rows, head, M, y + 16, chartW, chartH - 16);
+    if (chart === 'column' || chart === 'stacked_column') drawColumnChart(doc, data.time.rows, head, M, y + 16, chartW, chartH - 16, chart === 'stacked_column' && head.kind !== 'derived');
+    else drawLineChart(doc, data.time.rows, head, M, y + 16, chartW, chartH - 16);
   } else if (data.breakdown) {
     doc.text(`${head.label} by ${DIMENSIONS[data.breakdown.dim].label.toLowerCase()}`, M, y);
     drawBarChart(doc, data.breakdown.rows.slice(0, 12), head, M, y + 16, chartW, chartH - 16);
@@ -166,4 +171,69 @@ function drawBarChart(doc, rows, measure, x, y, w, h) {
     doc.rect(x + labelW, yy, Math.max(bw, 1), bh).fill(SERIES[0]);
     doc.fillColor(MUTED).fontSize(7).text(fmt(r[measure.name], measure.format, true), x + labelW + bw + 4, yy + bh / 2 - 4, { lineBreak: false });
   });
+}
+
+function legend(doc, series, x, y) {
+  let lx = x + 50;
+  doc.font('Helvetica').fontSize(7);
+  series.forEach((s, si) => {
+    doc.rect(lx, y + 2, 8, 6).fill(SERIES[si % SERIES.length]);
+    doc.fillColor(INK).text(s, lx + 11, y + 1, { lineBreak: false });
+    lx += 16 + doc.widthOfString(s);
+  });
+}
+
+// Grouped or stacked columns per time period (stacking only for additive measures).
+function drawColumnChart(doc, rows, measure, x, y, w, h, stacked) {
+  const ts = [...new Set(rows.map((r) => r.t))].sort();
+  const totals = {};
+  rows.forEach((r) => { totals[r.s] = (totals[r.s] || 0) + (Number(r[measure.name]) || 0); });
+  const series = Object.keys(totals).sort((a, b) => totals[b] - totals[a]).slice(0, 7);
+  const val = (t, s) => Number(rows.find((r) => r.t === t && r.s === s)?.[measure.name]) || 0;
+  const legendH = 14;
+  const ph = h - 18 - legendH;
+  const peak = stacked ? Math.max(...ts.map((t) => series.reduce((a, s) => a + Math.max(val(t, s), 0), 0))) : Math.max(...ts.flatMap((t) => series.map((s) => val(t, s))));
+  const max = niceMax(peak);
+  axes(doc, x, y + legendH, w, ph, max, measure.format);
+  const slot = (w - 56) / Math.max(ts.length, 1);
+  const base = y + legendH + ph;
+  ts.forEach((t, i) => {
+    const sx = x + 50 + i * slot + slot * 0.15;
+    const bw = slot * 0.7;
+    let acc = 0;
+    series.forEach((s, si) => {
+      const v = Math.max(val(t, s), 0);
+      const hh = (ph * v) / max;
+      doc.fillColor(SERIES[si % SERIES.length]);
+      if (stacked) { doc.rect(sx, base - acc - hh, bw, hh).fill(); acc += hh; }
+      else { const gw = bw / series.length; doc.rect(sx + si * gw, base - hh, Math.max(gw - 0.5, 0.5), hh).fill(); }
+    });
+  });
+  doc.font('Helvetica').fontSize(6.5).fillColor(MUTED);
+  const step = Math.ceil(ts.length / 12);
+  ts.forEach((t, i) => { if (i % step === 0) doc.text(String(t), x + 50 + i * slot + slot / 2 - 20, base + 4, { width: 40, align: 'center' }); });
+  legend(doc, series, x, y);
+}
+
+function drawDetailTable(doc, data, x, y, w, h) {
+  const ms = data.measures;
+  const cols = data.table.columns;
+  const cw = w / cols.length;
+  doc.font('Helvetica-Bold').fontSize(7.5).fillColor(MUTED);
+  cols.forEach((c, i) => {
+    const m = ms.find((mm) => mm.name === c);
+    doc.text(m ? m.label : (DIMENSIONS[c]?.label || c), x + i * cw, y, { width: cw - 4, align: m ? 'right' : 'left', height: 20 });
+  });
+  let ty = y + 20;
+  doc.moveTo(x, ty - 3).lineTo(x + w, ty - 3).lineWidth(0.6).strokeColor(RULE).stroke();
+  doc.font('Helvetica').fontSize(7.5).fillColor(INK);
+  const maxRows = Math.floor((h - 24) / 11);
+  for (const r of data.table.rows.slice(0, maxRows)) {
+    cols.forEach((c, i) => {
+      const m = ms.find((mm) => mm.name === c);
+      doc.text(m ? fmt(r[c], m.format, true) : String(r[c] ?? '-'), x + i * cw, ty, { width: cw - 4, align: m ? 'right' : 'left', height: 10, ellipsis: true });
+    });
+    ty += 11;
+  }
+  if (data.table.rows.length > maxRows) doc.fillColor(MUTED).fontSize(7).text(`First ${maxRows} of ${data.table.rows.length} rows - full detail in the portal`, x, ty + 2);
 }

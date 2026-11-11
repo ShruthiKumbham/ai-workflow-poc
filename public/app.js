@@ -27,7 +27,7 @@ function fmt(v, format, compact = false) {
 }
 const when = (ts) => (ts ? String(ts).replace('T', ' ').slice(0, 16) : '-');
 const pill = (cls, text) => `<span class="pill ${esc(cls)}">${esc(text ?? cls)}</span>`;
-const statusText = { pending_review: 'Pending review', deployed: 'Live', rejected: 'Rejected', failed: 'Failed', completed: 'Completed', blocked: 'Blocked', needs_input: 'Needs input', processing: 'Processing', received: 'Received' };
+const statusText = { superseded: 'Superseded', pending_review: 'Pending review', deployed: 'Live', rejected: 'Rejected', failed: 'Failed', completed: 'Completed', blocked: 'Blocked', needs_input: 'Needs input', processing: 'Processing', received: 'Received' };
 function toast(msg, err = false) {
   const t = $('#toast');
   t.textContent = msg;
@@ -82,10 +82,12 @@ const EXAMPLES = {
     'Warranty cost as % of revenue by vertical and quarter for 2025',
     'Which dealers had the most warranty claims this year, and what was the average claim cost?',
     'Revenue and units sold by quarter and region for 2024 and 2025',
+    'Quarterly warranty cost by product line for 2025 as a stacked column chart, executive layout',
   ],
   quality: [
     'Alert me when monthly warranty cost for any product line rises more than 50% month over month',
     'Notify me if warranty claims for any region exceed 160 in a month',
+    'Alert me when monthly warranty cost for any product line rises more than 50% month over month and claims exceed 100',
   ],
 };
 let persona = 'engineer';
@@ -177,21 +179,53 @@ async function renderReview() {
 }
 
 // ---------- Artifact detail ----------
+// EDITS holds changes the reviewer makes on the review screen (mapping, layer rules, presentation,
+// alert conditions). "Request changes" sends them, with the comment, to regenerate a new version.
+let VOCAB = null;
+let EDITS = {};
+const editCount = () => {
+  let n = 0;
+  if (EDITS.columns) n += Object.keys(EDITS.columns).length;
+  if (EDITS.layer_rules) n += Object.keys(EDITS.layer_rules).length;
+  for (const k of ['chart', 'layout', 'breakdown_dimension', 'combine', 'dimension', 'lookback_months']) if (EDITS[k] !== undefined) n += 1;
+  if (EDITS.conditions) n += 1;
+  return n;
+};
+function refreshEditCount() {
+  const el = $('#editCount');
+  if (!el) return;
+  const n = editCount();
+  el.hidden = !n;
+  el.innerHTML = `<b>${n} change${n === 1 ? '' : 's'}</b> made on this screen. Use <b>Request changes</b> to regenerate and re-run the dry run.`;
+}
+const flatRules = (r) => ({
+  bronze_load_mode: r.bronze.load_mode, silver_keep_statuses: r.silver.keep_statuses, gold_include_statuses: r.gold.include_statuses,
+  quarantine_bad_date: r.silver.quarantine_bad_date, quarantine_negative_amounts: r.silver.quarantine_negative_amounts,
+});
+
 async function renderArtifact(id) {
+  if (!VOCAB) VOCAB = await api('/api/vocabulary');
   const a = await api(`/api/artifacts/${encodeURIComponent(id)}`);
   const p = a.payload;
-  const tabs = a.kind === 'onboarding' ? onboardingTabs(a) : a.kind === 'report' ? reportTabs(a) : alertTabs(a);
+  EDITS = {};
+  const editable = a.status === 'pending_review';
+  const tabs = a.kind === 'onboarding' ? onboardingTabs(a, editable) : a.kind === 'report' ? reportTabs(a, editable) : alertTabs(a, editable);
+  const rev = p.revision;
+  const newer = a.status === 'superseded' ? (a.review_comment || '').match(/→\s*([A-Z]+-[0-9A-F]+)/)?.[1] : null;
   view.innerHTML = `
   <div class="page-head"><div>
-    <div class="row" style="margin-bottom:6px"><a href="#/review">&larr; Review queue</a><span class="faint">${esc(a.id)}</span>${pill(a.kind)}${pill(a.status, statusText[a.status])}</div>
+    <div class="row" style="margin-bottom:6px"><a href="#/review">&larr; Review queue</a><span class="faint">${esc(a.id)}</span>${pill(a.kind)}${pill(a.status, statusText[a.status])}${pill('version', `v${rev?.version || 1}`)}</div>
     <h1>${esc(a.title)}</h1><p>${esc(a.summary)}</p>
   </div></div>
+  ${newer ? `<div class="callout warn mb">Changes were requested on this version. The current version is <a href="#/artifact/${esc(newer)}"><b>${esc(newer)}</b></a>.</div>` : ''}
   <div class="detail-grid">
     <div>
       <div class="card">
         <div class="tabs" id="tabs">${tabs.map((t, i) => `<button data-i="${i}" class="${i ? '' : 'on'}">${esc(t.label)}</button>`).join('')}</div>
         <div id="tabBody"></div>
       </div>
+      ${rev ? `<div class="card"><h3>Revision history</h3><ul class="notes">${rev.history.map((h) => `<li><span class="who"><a href="#/artifact/${esc(h.artifact_id)}">v${h.version} &middot; ${esc(h.artifact_id)}</a></span><span><b>${esc(h.requested_by)}</b> requested changes${h.comment ? `: &ldquo;${esc(h.comment)}&rdquo;` : ' on the review screen'}<div class="faint">${(h.changes || []).map(esc).join('<br>')}</div></span></li>`).join('')}
+        <li><span class="who">v${rev.version} &middot; this</span><span>Regenerated and dry-run again.${rev.not_applied?.length ? ` <span style="color:var(--amber)">Not applied: ${rev.not_applied.map(esc).join(' | ')}</span>` : ''}</span></li></ul></div>` : ''}
       <div class="card">
         <h3>How this was produced</h3>
         <ul class="notes">${(p.notes || []).map((n) => `<li><span class="who">${esc(n.step)}</span><span>${n.engine === 'claude' ? pill('claude', 'Claude') : n.engine === 'rules' ? pill('', 'Rules') : pill('', 'Deterministic')} ${esc(n.note)}</span></li>`).join('')}</ul>
@@ -206,6 +240,12 @@ async function renderArtifact(id) {
   wireDecision(a);
 }
 
+const COMMENT_HINTS = {
+  onboarding: ['Keep only APPROVED and PAID in silver', 'Exclude PENDING from gold', 'Quarantine negative amounts', 'Load incrementally using the claim date', 'Rename FAIL_DESC to failure_text'],
+  report: ['Use a stacked column chart', 'Executive layout', 'Add average claim cost', 'Break down by dealer', 'For 2024'],
+  alert: ['Add a condition: claims exceed 150', 'Change 50% to 30%', 'Fire when any condition holds', 'Per region'],
+};
+
 function decisionPanel(a) {
   const p = a.payload;
   if (a.status !== 'pending_review') {
@@ -216,6 +256,7 @@ function decisionPanel(a) {
     if (a.kind === 'alert' && d?.alertId) links = `<a class="btn primary" href="#/alerts">View alert &rarr;</a>`;
     return `<div class="card"><h3>Decision</h3>
       <dl class="kv"><dt>Status</dt><dd>${pill(a.status, statusText[a.status])}</dd><dt>Reviewer</dt><dd>${esc(a.reviewer || '-')}</dd><dt>When</dt><dd>${when(a.decided_at)}</dd><dt>Comment</dt><dd>${esc(a.review_comment || '-')}</dd></dl>
+      ${d?.rebuilt?.length ? `<p class="muted">Rebuilt with the new rules: <span class="mono">${d.rebuilt.map(esc).join(', ')}</span></p>` : ''}
       <div class="row mt">${links}</div></div>`;
   }
   const blocking = (a.kind === 'onboarding' ? p.preview.checks : a.kind === 'report' ? p.preview.checks : []).filter((c) => c.severity === 'error' && !c.passed);
@@ -224,31 +265,64 @@ function decisionPanel(a) {
   return `<div class="card"><h3>Approval gate</h3>
     <div class="callout ${blocking.length || !recon ? 'bad' : 'ok'}" style="margin-bottom:12px">${blocking.length ? `${blocking.length} blocking check(s) failed in the dry run. Approving will be refused at deploy unless fixed.` : !recon ? 'Report totals do not reconcile to source. Review before approving.' : 'Dry run passed all blocking checks.'}</div>
     <label>Reviewer</label><input type="text" id="reviewer" value="${esc(STATUS?.reviewer || 'Data Steward')}">
-    <label class="mt">Comment</label><textarea id="comment" rows="3" placeholder="Optional note for the audit trail"></textarea>
+    <label class="mt">Comment</label><textarea id="comment" rows="4" placeholder="A note for the audit trail, or the changes you want, in plain English"></textarea>
+    <div class="chips" style="margin-top:6px">${COMMENT_HINTS[a.kind].map((h) => `<button class="chip hint" type="button">${esc(h)}</button>`).join('')}</div>
+    <div class="callout warn mt" id="editCount" hidden></div>
     ${suggestions.length ? `<label class="mt" style="display:flex;gap:8px;align-items:flex-start;font-weight:500;color:var(--ink)"><input type="checkbox" id="acceptSug" checked style="margin-top:3px"> Accept ${suggestions.length} suggested part-number correction(s) (${suggestions.reduce((s, e) => s + e.row_count, 0)} rows) as steward overrides</label>` : ''}
-    <div class="row mt"><button class="btn good" id="approveBtn">Approve &amp; deploy</button><button class="btn bad" id="rejectBtn">Reject</button></div>
-    <p class="faint" style="margin-bottom:0">Approving runs exactly the SQL shown here, re-checks data quality, and records the result in the catalog, lineage and audit trail.</p>
+    <div class="row mt"><button class="btn good" id="approveBtn">Approve &amp; deploy</button><button class="btn warn" id="changesBtn">Request changes</button><button class="btn bad" id="rejectBtn">Reject</button></div>
+    <p class="faint" style="margin-bottom:0"><b>Approve</b> runs exactly the SQL shown here, re-checks data quality and records it in the catalog, lineage and audit trail. <b>Request changes</b> applies your comment and on-screen edits, regenerates the proposal as a new version and dry-runs it again. <b>Reject</b> closes the request.</p>
   </div>`;
 }
 
+function editsForApi(kind) {
+  const e = structuredClone(EDITS);
+  if (kind === 'onboarding' && e.columns) e.columns = Object.entries(e.columns).map(([source_column, v]) => ({ source_column, ...v }));
+  return e;
+}
+
 function wireDecision(a) {
+  const btns = () => [$('#approveBtn'), $('#rejectBtn'), $('#changesBtn')].filter(Boolean);
   const go = async (decision) => {
     const reviewer = $('#reviewer').value.trim();
     if (!reviewer) return toast('Enter a reviewer name', true);
-    const btns = [$('#approveBtn'), $('#rejectBtn')];
-    btns.forEach((b) => { b.disabled = true; });
+    if (decision === 'approve' && editCount() && !confirm('You have unsaved changes on this screen. Approve the version as generated and discard them?')) return;
+    btns().forEach((b) => { b.disabled = true; });
     try {
       const r = await api(`/api/artifacts/${a.id}/decision`, { method: 'POST', body: { decision, reviewer, comment: $('#comment').value, acceptSuggestions: $('#acceptSug')?.checked } });
       toast(r.message || (decision === 'reject' ? 'Rejected' : 'Deployed'));
       router();
     } catch (err) {
       toast(err.message, true);
-      btns.forEach((b) => { b.disabled = false; });
+      btns().forEach((b) => { b.disabled = false; });
       router();
+    }
+  };
+  const requestChanges = async () => {
+    const reviewer = $('#reviewer').value.trim();
+    if (!reviewer) return toast('Enter a reviewer name', true);
+    const comment = $('#comment').value.trim();
+    if (!comment && !editCount()) return toast('Describe the change in the comment box, or edit the proposal on this screen', true);
+    btns().forEach((b) => { b.disabled = true; });
+    const label = $('#changesBtn').textContent;
+    $('#changesBtn').innerHTML = '<span class="spinner"></span> Regenerating';
+    try {
+      const r = await api(`/api/artifacts/${a.id}/revise`, { method: 'POST', body: { reviewer, comment, edits: editsForApi(a.kind) } });
+      toast(`${r.message}${r.notApplied?.length ? ` Not applied: ${r.notApplied.join(' | ')}` : ''}`);
+      location.hash = `#/artifact/${r.artifactId}`;
+    } catch (err) {
+      toast(err.message, true);
+      btns().forEach((b) => { b.disabled = false; });
+      $('#changesBtn').textContent = label;
     }
   };
   $('#approveBtn')?.addEventListener('click', () => go('approve'));
   $('#rejectBtn')?.addEventListener('click', () => go('reject'));
+  $('#changesBtn')?.addEventListener('click', requestChanges);
+  document.querySelectorAll('.chip.hint').forEach((c) => c.addEventListener('click', () => {
+    const t = $('#comment');
+    t.value = `${t.value.trim() ? `${t.value.trim().replace(/[.]?$/, '.')} ` : ''}${c.textContent}. `;
+    t.focus();
+  }));
 }
 
 function checksHtml(checks) {
@@ -265,25 +339,118 @@ function sampleTable(rows, max = 12) {
   return `<div class="scroll"><table class="t"><thead><tr>${cols.map((c) => `<th>${esc(c)}</th>`).join('')}</tr></thead><tbody>${rows.slice(0, max).map((r) => `<tr>${cols.map((c) => `<td class="${typeof r[c] === 'number' ? 'num' : ''}">${esc(typeof r[c] === 'number' ? (Number.isInteger(r[c]) ? r[c] : r[c].toFixed(2)) : r[c])}</td>`).join('')}</tr>`).join('')}</tbody></table></div>`;
 }
 
-function onboardingTabs(a) {
+const options = (list, current) => list.map(([v, l]) => `<option value="${esc(v)}" ${String(v) === String(current) ? 'selected' : ''}>${esc(l)}</option>`).join('');
+
+function onboardingTabs(a, editable) {
   const p = a.payload;
   const prof = p.profile;
   const pv = p.preview;
   const profByCol = Object.fromEntries(prof.columns.map((c) => [c.name, c]));
-  return [
-    { label: 'Schema mapping', html: () => `
+  const hasParts = p.mapping.columns.some((c) => c.role === 'part_number');
+  const lr = p.layer_rules;
+  const ruleVal = (k) => (EDITS.layer_rules && k in EDITS.layer_rules ? EDITS.layer_rules[k] : lr ? flatRules(lr)[k] : undefined);
+  const colVal = (c, k) => EDITS.columns?.[c.source_column]?.[k] ?? c[k];
+  const setCol = (src, k, v) => {
+    const orig = p.mapping.columns.find((c) => c.source_column === src);
+    EDITS.columns ||= {};
+    const e = EDITS.columns[src] || {};
+    if (String(orig[k]) === String(v)) delete e[k]; else e[k] = v;
+    if (Object.keys(e).length) EDITS.columns[src] = e; else delete EDITS.columns[src];
+    if (!Object.keys(EDITS.columns).length) delete EDITS.columns;
+    refreshEditCount();
+  };
+  const setRule = (k, v) => {
+    const orig = flatRules(lr)[k];
+    EDITS.layer_rules ||= {};
+    if (JSON.stringify(orig) === JSON.stringify(v)) delete EDITS.layer_rules[k]; else EDITS.layer_rules[k] = v;
+    if (!Object.keys(EDITS.layer_rules).length) delete EDITS.layer_rules;
+    refreshEditCount();
+  };
+
+  const tabs = [
+    { label: 'Schema mapping (columns)', html: () => `
+      <div class="callout mb"><b>Schema mapping</b> decides how each <b>source column</b> becomes a <b>Silver column</b>: its name, business role and the transform applied (typing, trimming, hashing personal data). ${editable ? 'You can change any of these here, then use <b>Request changes</b>.' : ''}</div>
       <div class="callout mb">${esc(p.mapping.summary)}${p.mapping.assumptions?.length ? `<div class="faint mt" style="margin-top:6px">Assumptions: ${esc(p.mapping.assumptions.join(' '))}</div>` : ''}</div>
       <div class="row mb"><span class="muted">Target</span><b class="mono">${esc(p.targets.silver)}</b><span class="muted">Business key</span><b class="mono">${esc(p.mapping.business_key.join(', '))}</b><span class="muted">Domain</span>${pill('', p.mapping.domain)}</div>
       <div class="scroll" style="max-height:560px"><table class="t"><thead><tr><th>Source column</th><th>Profile</th><th></th><th>Silver column</th><th>Role</th><th>Transform</th><th>Rationale</th></tr></thead><tbody>
-      ${p.mapping.columns.map((c) => { const pc = profByCol[c.source_column] || {}; return `<tr><td class="mono"><b>${esc(c.source_column)}</b></td><td class="faint">${esc((pc.samples || []).slice(0, 3).join(', '))}<br>${pc.null_pct ?? 0}% empty &middot; ${fmt(pc.distinct)} distinct</td><td class="arrow">&rarr;</td><td class="mono"><b>${esc(c.target_column)}</b>${c.pii ? ' ' + pill('error', 'PII') : ''}</td><td>${pill('', c.role)}</td><td class="mono">${esc(c.transform)}</td><td class="muted">${esc(c.description)}</td></tr>`; }).join('')}
-      </tbody></table></div>` },
+      ${p.mapping.columns.map((c) => { const pc = profByCol[c.source_column] || {}; return `<tr data-src="${esc(c.source_column)}"><td class="mono"><b>${esc(c.source_column)}</b></td><td class="faint">${esc((pc.samples || []).slice(0, 3).join(', '))}<br>${pc.null_pct ?? 0}% empty &middot; ${fmt(pc.distinct)} distinct</td><td class="arrow">&rarr;</td>
+        ${editable ? `<td><input type="text" class="edit mono" data-k="target_column" value="${esc(colVal(c, 'target_column'))}"><label class="inline"><input type="checkbox" data-k="pii" ${colVal(c, 'pii') ? 'checked' : ''}> personal data (hash)</label></td>
+          <td><select class="edit" data-k="role">${options(VOCAB.roles.map((r) => [r, r]), colVal(c, 'role'))}</select></td>
+          <td><select class="edit" data-k="transform">${options(Object.entries(VOCAB.transforms), colVal(c, 'transform'))}</select></td>`
+        : `<td class="mono"><b>${esc(c.target_column)}</b>${c.pii ? ' ' + pill('error', 'PII') : ''}</td><td>${pill('', c.role)}</td><td class="mono">${esc(c.transform)}</td>`}
+        <td class="muted">${esc(c.description)}</td></tr>`; }).join('')}
+      </tbody></table></div>`,
+    after: (el) => {
+      el.querySelectorAll('tr[data-src]').forEach((tr) => {
+        tr.querySelectorAll('[data-k]').forEach((inp) => inp.addEventListener('change', () => setCol(tr.dataset.src, inp.dataset.k, inp.type === 'checkbox' ? inp.checked : inp.value.trim())));
+      });
+    } },
+  ];
+
+  if (lr) tabs.push({ label: 'Layer rules (Bronze / Silver / Gold)', html: () => {
+    const desc = (layer) => p.rule_descriptions.filter((d) => d.layer === layer).map((d) => `<li>${esc(d.rule)}</li>`).join('');
+    const statusBoxes = (k, list) => lr.status_values.map((s) => `<label class="inline"><input type="checkbox" data-rule="${k}" value="${esc(s)}" ${list.includes(s) ? 'checked' : ''} ${editable ? '' : 'disabled'}> ${esc(s)}</label>`).join('');
+    const flow = pv.layers?.statusFlow || [];
+    return `
+      <div class="callout mb">These rules decide <b>which rows land in each layer</b>. They are compiled into the pipeline SQL, so what you agree here is exactly what runs. ${editable ? 'Change any rule, then use <b>Request changes</b> to regenerate and re-run the dry run.' : ''}</div>
+      <div class="grid g3 layers">
+        <div class="card layer-card bronze"><h3>${pill('layer-bronze', 'Bronze')} raw history</h3>
+          <ul class="rules">${desc('bronze')}</ul>
+          <label class="mt">Load rule</label><select data-rule="bronze_load_mode" ${editable ? '' : 'disabled'}>${options(Object.entries(VOCAB.load_modes).map(([k, v]) => [k, v.split(':')[0]]), ruleVal('bronze_load_mode'))}</select>
+          <div class="faint" style="margin-top:6px">${esc(VOCAB.load_modes[ruleVal('bronze_load_mode')])}</div>
+        </div>
+        <div class="card layer-card silver"><h3>${pill('layer-silver', 'Silver')} clean, current records</h3>
+          <ul class="rules">${desc('silver')}</ul>
+          ${lr.status_column ? `<label class="mt">Keep in Silver (${esc(lr.status_column)})</label><div class="boxes">${statusBoxes('silver_keep_statuses', ruleVal('silver_keep_statuses'))}</div>` : ''}
+          <label class="mt">Quarantine rules</label>
+          <label class="inline"><input type="checkbox" data-rule="quarantine_bad_date" ${ruleVal('quarantine_bad_date') ? 'checked' : ''} ${editable ? '' : 'disabled'}> Quarantine rows with a missing or bad date</label>
+          <label class="inline"><input type="checkbox" data-rule="quarantine_negative_amounts" ${ruleVal('quarantine_negative_amounts') ? 'checked' : ''} ${editable ? '' : 'disabled'}> Quarantine rows with negative amounts</label>
+        </div>
+        <div class="card layer-card gold"><h3>${pill('layer-gold', 'Gold')} reporting</h3>
+          <ul class="rules">${desc('gold')}</ul>
+          ${lr.status_column ? `<label class="mt">Include in Gold facts and reports</label><div class="boxes">${statusBoxes('gold_include_statuses', ruleVal('gold_include_statuses'))}</div>` : '<p class="faint">No status column in this source, so every Silver row is available to Gold.</p>'}
+        </div>
+      </div>
+      ${flow.length ? `<h3 class="mt">Effect on this data (dry run)</h3><table class="t"><thead><tr><th>${esc(lr.status_column)}</th><th class="num">Rows</th><th>Bronze</th><th>Silver</th><th>Gold</th></tr></thead><tbody>
+        ${flow.map((f) => `<tr><td class="mono"><b>${esc(f.status)}</b></td><td class="num">${fmt(f.rows)}</td><td class="ok">&#10003; kept</td><td class="${f.in_silver ? 'ok' : 'bad'}">${f.in_silver ? '&#10003; kept' : '&#10005; history only'}</td><td class="${f.in_gold ? 'ok' : 'bad'}">${f.in_gold ? '&#10003; included' : '&#10005; excluded'}</td></tr>`).join('')}
+      </tbody></table><p class="faint">Counts are after de-duplication and quarantine. The table reflects the generated version; edits take effect after Request changes.</p>` : ''}
+      ${(p.warnings || []).map((w) => `<div class="callout warn mt">${esc(w)}</div>`).join('')}`;
+  },
+  after: (el) => {
+    el.querySelectorAll('[data-rule]').forEach((inp) => inp.addEventListener('change', () => {
+      const k = inp.dataset.rule;
+      if (k.endsWith('_statuses')) setRule(k, [...el.querySelectorAll(`[data-rule="${k}"]:checked`)].map((x) => x.value).sort());
+      else if (inp.type === 'checkbox') setRule(k, inp.checked);
+      else { setRule(k, inp.value); inp.nextElementSibling.textContent = VOCAB.load_modes[inp.value]; }
+    }));
+  } });
+
+  if (pv.layers) tabs.push({ label: 'Layer preview', html: () => {
+    const c = pv.counts;
+    const L = pv.layers;
+    const box = (cls, title, n, sub) => `<div class="flow-box ${cls}"><div class="t">${title}</div><div class="n">${fmt(n)}</div><div class="faint">${sub}</div></div>`;
+    return `
+      <p class="muted" style="margin-top:0">How the rows move through the layers in the dry run (rolled back, not yet live).</p>
+      <div class="flowline">
+        ${box('src', 'Source', c.source, esc(prof.table))}<span class="arr">&rarr;</span>
+        ${box('bronze', 'Bronze', c.bronze, `${fmt(c.bronze_batch ?? c.bronze)} this batch${c.bronze - (c.bronze_batch ?? c.bronze) ? ` + ${fmt(c.bronze - c.bronze_batch)} history` : ''}`)}<span class="arr">&rarr;</span>
+        ${box('silver', 'Silver', c.silver, `${fmt(c.quarantine)} quarantined &middot; ${fmt(c.excluded_by_rule || 0)} excluded by rule &middot; ${fmt(c.duplicates_removed)} duplicates`)}<span class="arr">&rarr;</span>
+        ${box('gold', 'Gold-ready', L.goldRows, 'rows that Gold facts will include')}
+      </div>
+      <h3 class="mt">${pill('layer-bronze', 'Bronze')} <span class="mono" style="text-transform:none">${esc(p.targets.bronze)}</span> &middot; raw values with audit columns</h3>${sampleTable(L.bronzeSample, 5)}
+      <h3 class="mt">${pill('layer-silver', 'Silver')} <span class="mono" style="text-transform:none">${esc(p.targets.silver)}</span> &middot; typed, renamed, hashed, mapped</h3>${sampleTable(pv.sample, 5)}
+      <h3 class="mt">${pill('error', 'Quarantine')} <span class="mono" style="text-transform:none">${esc(p.targets.quarantine)}</span> &middot; rows that failed a rule, with the reason</h3>${sampleTable(L.quarantineSample, 5)}
+      <h3 class="mt">${pill('layer-gold', 'Gold-ready')} &middot; Silver rows that pass the Gold inclusion rule</h3>${sampleTable(L.goldSample, 5)}`;
+  } });
+
+  tabs.push(
     { label: 'Source profile', html: () => `
       <div class="row mb"><span class="muted">Table</span><b class="mono">${esc(prof.table)}</b><span class="muted">Rows</span><b>${fmt(prof.row_count)}</b><span class="muted">Exact duplicate rows</span><b>${fmt(prof.exact_duplicate_rows)}</b></div>
       <div class="scroll" style="max-height:560px"><table class="t"><thead><tr><th>Column</th><th class="num">Empty %</th><th class="num">Distinct</th><th class="num">Unique ratio</th><th>Detected patterns</th><th>Top values</th></tr></thead><tbody>
       ${prof.columns.map((c) => `<tr><td class="mono"><b>${esc(c.name)}</b></td><td class="num">${c.null_pct}</td><td class="num">${fmt(c.distinct)}</td><td class="num">${c.unique_ratio}</td><td>${Object.entries(c.patterns).map(([k, v]) => pill('', `${k} ${v}%`)).join(' ') || '<span class="faint">free text</span>'}</td><td class="faint">${c.top_values.slice(0, 4).map((t) => `${esc(t.value ?? '<empty>')} (${t.n})`).join(', ')}</td></tr>`).join('')}
       </tbody></table></div>` },
     { label: 'Pipelines (SQL)', html: () => `
-      <p class="muted" style="margin-top:0">Compiled from the mapping using the platform conventions. This exact SQL runs on approval.</p>
+      <p class="muted" style="margin-top:0">Compiled from the mapping and layer rules using the platform conventions. This exact SQL runs on approval.</p>
       <h3>Bronze &middot; ${esc(p.targets.bronze)}</h3><pre class="sql">${highlightSql(p.sql.bronze)}</pre>
       <h3 class="mt">Silver &middot; ${esc(p.targets.silver)}</h3><pre class="sql">${highlightSql(p.sql.silver)}</pre>
       <h3 class="mt">Quarantine &middot; ${esc(p.targets.quarantine)}</h3><pre class="sql">${highlightSql(p.sql.quarantine)}</pre>` },
@@ -291,38 +458,57 @@ function onboardingTabs(a) {
       <div class="grid g4 mb">${[['Source rows', pv.counts.source], ['Silver rows', pv.counts.silver], ['Quarantined', pv.counts.quarantine], ['Duplicates removed', pv.counts.duplicates_removed]].map(([l, v]) => `<div class="card kpi"><div class="l">${l}</div><div class="v">${fmt(v)}</div></div>`).join('')}</div>
       ${checksHtml(pv.checks)}
       ${pv.quarantineReasons?.length ? `<h3 class="mt">Quarantine reasons</h3>${sampleTable(pv.quarantineReasons)}` : ''}` },
-    { label: `Part mapping (${pv.exceptions.length} exceptions)`, html: () => `
-      ${pv.mappingStats?.length ? `<div class="grid g4 mb">${pv.mappingStats.map((s) => `<div class="card kpi" style="border-left-color:${s.status === 'unmapped' ? 'var(--red)' : 'var(--green)'}"><div class="l">${esc(s.status)}</div><div class="v">${fmt(s.n)}</div></div>`).join('')}</div>
+  );
+  if (hasParts) tabs.push({ label: `Part mapping (${pv.exceptions.length} exceptions)`, html: () => `
+      <div class="callout mb"><b>Part mapping</b> is different from schema mapping: it maps each claim's <b>part number value</b> to Allison's <b>product hierarchy</b> (model family, product line, vertical). It only appears when the source has a part-number column.</div>
+      ${pv.mappingStats?.length ? `<div class="grid g4 mb">${pv.mappingStats.map((s) => `<div class="card kpi" style="border-left-color:${s.status === 'unmapped' ? 'var(--red)' : 'var(--green)'}"><div class="l">${esc(s.status)}</div><div class="v">${fmt(s.n)}</div></div>`).join('')}</div>` : ''}
       <p class="muted">Part numbers are cleaned (prefixes such as AT-, revision suffixes, spaces), resolved through supersession and matched to <span class="mono">silver.product_hierarchy</span>. Exceptions are flagged here rather than guessed.</p>
-      ${pv.exceptions.length ? `<div class="scroll"><table class="t"><thead><tr><th>Standardised value</th><th>Raw values seen</th><th class="num">Rows</th><th>Reason</th><th>Suggested part</th></tr></thead><tbody>${pv.exceptions.map((e) => `<tr><td class="mono">${esc(e.normalized ?? '<blank>')}</td><td class="mono faint">${esc(e.raw_values)}</td><td class="num">${fmt(e.row_count)}</td><td>${esc(e.reason)}</td><td class="mono">${e.suggestion ? `<b>${esc(e.suggestion)}</b>` : '<span class="faint">-</span>'}</td></tr>`).join('')}</tbody></table></div>` : '<div class="callout ok">All part numbers mapped.</div>'}`
-      : '<div class="empty">No part-number column in this source.</div>'}` },
-    { label: 'Sample output', html: () => `<p class="muted" style="margin-top:0">Rows from the dry-run Silver table (rolled back - not yet live).</p>${sampleTable(pv.sample)}` },
-  ];
+      ${pv.exceptions.length ? `<div class="scroll"><table class="t"><thead><tr><th>Standardised value</th><th>Raw values seen</th><th class="num">Rows</th><th>Reason</th><th>Suggested part</th></tr></thead><tbody>${pv.exceptions.map((e) => `<tr><td class="mono">${esc(e.normalized ?? '<blank>')}</td><td class="mono faint">${esc(e.raw_values)}</td><td class="num">${fmt(e.row_count)}</td><td>${esc(e.reason)}</td><td class="mono">${e.suggestion ? `<b>${esc(e.suggestion)}</b>` : '<span class="faint">-</span>'}</td></tr>`).join('')}</tbody></table></div>` : '<div class="callout ok">All part numbers mapped.</div>'}` });
+  tabs.push({ label: 'Sample output', html: () => `<p class="muted" style="margin-top:0">Rows from the dry-run Silver table (rolled back - not yet live).</p>${sampleTable(pv.sample)}` });
+  return tabs;
 }
 
-function reportTabs(a) {
+function reportTabs(a, editable) {
   const p = a.payload;
   const s = p.spec;
   const pv = p.preview;
+  const layout = s.layout || 'standard';
+  const val = (k, d) => EDITS[k] ?? d;
+  const setEdit = (k, v, orig) => { if (String(v) === String(orig)) delete EDITS[k]; else EDITS[k] = v; refreshEditCount(); };
+  const hasTime = s.dimensions.some((d) => VOCAB.dimensions[d]?.time);
+  const allowed = Object.entries(VOCAB.charts).filter(([k]) => (hasTime ? k !== 'bar' : !['line', 'column', 'stacked_column'].includes(k)));
+  const bdOpts = [['none', 'none'], ...Object.entries(VOCAB.dimensions).filter(([k, d]) => !d.time && !s.dimensions.includes(k)).map(([k, d]) => [k, d.label])];
   return [
-    { label: 'Preview dashboard', html: () => `<p class="muted" style="margin-top:0">Built from a dry run. Publishes to the portal and as a one-page PDF on approval.</p><div id="dash"></div>`, after: (el) => drawDashboard($('#dash', el), pv.data, s) },
-    { label: 'Requirement breakdown', html: () => `
+    { label: 'Preview dashboard', html: () => `<p class="muted" style="margin-top:0">Built from a dry run with the <b>${esc(VOCAB.charts[s.chart] || s.chart)}</b> chart and <b>${esc(layout)}</b> layout. Publishes to the portal and as a one-page PDF on approval.</p><div id="dash"></div>`, after: (el) => drawDashboard($('#dash', el), pv.data, s) },
+    { label: 'Requirement & presentation', html: () => `
       <div class="callout mb">&ldquo;${esc(p.request_text)}&rdquo;</div>
       <dl class="kv">
         <dt>Measures</dt><dd>${s.measures.map((m) => pill('report', m)).join(' ')}</dd>
         <dt>Dimensions</dt><dd>${s.dimensions.map((d) => pill('', DIM_LABEL[d] || d)).join(' ')}</dd>
         <dt>Breakdown</dt><dd>${s.breakdown_dimension !== 'none' ? pill('', DIM_LABEL[s.breakdown_dimension]) : '<span class="faint">none</span>'}</dd>
         <dt>Period</dt><dd>${esc(s.date_from)} to ${esc(s.date_to)}</dd>
-        <dt>Chart</dt><dd>${esc(s.chart)}</dd>
         <dt>Assumptions</dt><dd>${(s.assumptions || []).map((x) => `<div>${esc(x)}</div>`).join('')}${(p.warnings || []).map((w) => `<div style="color:var(--amber)">${esc(w)}</div>`).join('')}</dd>
-      </dl>` },
+      </dl>
+      <h3 class="mt">Presentation</h3>
+      <div class="grid g3">
+        <div><label>Main chart</label><select id="pChart" ${editable ? '' : 'disabled'}>${options(allowed, val('chart', s.chart))}</select></div>
+        <div><label>Layout</label><select id="pLayout" ${editable ? '' : 'disabled'}>${options(Object.entries(VOCAB.layouts), val('layout', layout))}</select></div>
+        <div><label>Breakdown</label><select id="pBreak" ${editable ? '' : 'disabled'}>${options(bdOpts, val('breakdown_dimension', s.breakdown_dimension))}</select></div>
+      </div>
+      <p class="faint">${Object.entries(VOCAB.layouts).map(([k, v]) => `<b>${esc(k)}</b>: ${esc(v.split(': ')[1])}`).join(' &middot; ')}. You can also ask for these in plain English, e.g. &ldquo;as a stacked column chart, executive layout&rdquo;.${editable ? ' Changes take effect after <b>Request changes</b>.' : ''}</p>`,
+    after: (el) => {
+      $('#pChart', el)?.addEventListener('change', (e) => setEdit('chart', e.target.value, s.chart));
+      $('#pLayout', el)?.addEventListener('change', (e) => setEdit('layout', e.target.value, layout));
+      $('#pBreak', el)?.addEventListener('change', (e) => setEdit('breakdown_dimension', e.target.value, s.breakdown_dimension));
+    } },
     { label: 'Gold plan', html: () => `
       <div class="grid g2">
         <div><h3>Reused Gold tables</h3>${p.plan.reuse.length ? p.plan.reuse.map((f) => `<div class="row" style="margin-bottom:6px">${pill('passed', 'reuse')}<span class="mono">${esc(f)}</span></div>`).join('') : '<span class="faint">none</span>'}
           <h3 class="mt">Reused measures</h3>${p.measures_reused.length ? p.measures_reused.map((m) => pill('', m)).join(' ') : '<span class="faint">none</span>'}</div>
         <div><h3>New Gold tables</h3>${p.plan.build.map((b) => `<div class="row" style="margin-bottom:6px">${pill('warning', 'build')}<span class="mono">${esc(b.fact)}</span><span class="faint">from ${esc(b.from)}</span></div>`).join('')}<div class="row">${pill('warning', 'build')}<span class="mono">${esc(p.table)}</span><span class="faint">report mart</span></div>
           <h3 class="mt">New measures</h3>${p.measures_new.length ? `<table class="t"><tbody>${p.measures_new.map((m) => `<tr><td class="mono">${esc(m.name)}</td><td class="muted">${esc(m.definition)}</td></tr>`).join('')}</tbody></table>` : '<span class="faint">none</span>'}</div>
-      </div>` },
+      </div>
+      ${Object.keys(p.fact_rules || {}).length ? `<h3 class="mt">Gold layer rules in force</h3>${Object.entries(p.fact_rules).map(([f, r]) => `<div class="row" style="margin-bottom:6px">${pill('layer-gold', 'gold rule')}<span class="mono">${esc(f)}</span><span class="muted">${r.status_column ? `includes ${esc(r.status_column)} ${r.gold.include_statuses.map(esc).join(', ')}` : 'all rows'}${r.silver?.quarantine_negative_amounts ? '; negative amounts quarantined' : ''} (agreed at onboarding)</span></div>`).join('')}` : ''}` },
     { label: `Reconciliation ${pv.reconciliation.passed ? '✓' : '✗'}`, html: () => reconHtml(pv.reconciliation) },
     { label: 'SQL', html: () => `${Object.entries(p.sql.facts).map(([f, sql]) => `<h3>${esc(f)}</h3><pre class="sql">${highlightSql(sql)}</pre>`).join('<div class="mt"></div>')}<h3 class="mt">${esc(p.table)}</h3><pre class="sql">${highlightSql(p.sql.mart)}</pre>` },
     { label: 'Data quality', html: () => checksHtml(pv.checks) },
@@ -336,26 +522,69 @@ function reconHtml(rec) {
   </tbody></table>`;
 }
 
-function alertTabs(a) {
+const condText = (c) => `${VOCAB?.measures[c.measure]?.label || c.measure} ${c.condition === 'pct_increase_gt' ? `up more than ${c.threshold}% month over month` : `above ${fmt(c.threshold)} in a month`}`;
+const specConditions = (s) => (s.conditions?.length ? s.conditions : [{ measure: s.measure, condition: s.condition, threshold: s.threshold }]);
+
+function alertTabs(a, editable) {
   const p = a.payload;
   const s = p.spec;
+  const conds = specConditions(s);
+  const fact = p.fact;
+  const measureOpts = Object.entries(VOCAB.measures).filter(([, m]) => m.fact === fact).map(([k, m]) => [k, m.label]);
+  const dimOpts = [['none', 'Overall'], ...(VOCAB.fact_dimensions[fact] || []).filter((d) => !VOCAB.dimensions[d].time).map((d) => [d, VOCAB.dimensions[d].label])];
+  const cur = () => EDITS.conditions || conds;
+  const setConds = (list) => { EDITS.conditions = list; if (JSON.stringify(list) === JSON.stringify(conds)) delete EDITS.conditions; refreshEditCount(); };
+  const setEdit = (k, v, orig) => { if (String(v) === String(orig)) delete EDITS[k]; else EDITS[k] = v; refreshEditCount(); };
   return [
-    { label: 'Rule', html: () => `
+    { label: `Rule (${conds.length} condition${conds.length > 1 ? 's' : ''})`, html: () => `
       <div class="callout mb">&ldquo;${esc(p.request_text)}&rdquo;</div>
-      <dl class="kv"><dt>Name</dt><dd>${esc(s.name)}</dd><dt>Measure</dt><dd>${pill('report', s.measure)}</dd><dt>Per</dt><dd>${s.dimension === 'none' ? 'overall' : esc(DIM_LABEL[s.dimension])}</dd><dt>Grain</dt><dd>${esc(s.grain)}</dd>
-      <dt>Condition</dt><dd>${s.condition === 'pct_increase_gt' ? `month-over-month increase &gt; ${esc(s.threshold)}%` : `monthly value &gt; ${fmt(s.threshold)}`}</dd><dt>Back-test window</dt><dd>${esc(s.lookback_months)} months</dd><dt>Source fact</dt><dd class="mono">${esc(p.fact)}</dd>
-      <dt>Assumptions</dt><dd>${(s.assumptions || []).map(esc).join('<br>')}</dd></dl>` },
-    { label: `Back-test (${p.preview.triggered_count} triggers)`, html: () => alertRows(p.preview.rows) },
+      <div class="row mb"><span class="muted">Fires when</span>
+        <select id="aCombine" style="width:auto" ${editable ? '' : 'disabled'}>${options([['all', 'ALL conditions hold (AND)'], ['any', 'ANY condition holds (OR)']], EDITS.combine ?? s.combine ?? 'all')}</select>
+        <span class="muted">per</span><select id="aDim" style="width:auto" ${editable ? '' : 'disabled'}>${options(dimOpts, EDITS.dimension ?? s.dimension)}</select>
+        <span class="muted">in the same month; back-test</span><input type="text" id="aLook" style="width:60px" value="${esc(EDITS.lookback_months ?? s.lookback_months)}" ${editable ? '' : 'disabled'}><span class="muted">months</span></div>
+      <table class="t conds"><thead><tr><th>#</th><th>Measure</th><th>Condition</th><th>Threshold</th>${editable ? '<th></th>' : ''}</tr></thead><tbody>
+      ${cur().map((c, i) => `<tr data-i="${i}"><td>${i + 1}</td>
+        <td>${editable ? `<select data-k="measure">${options(measureOpts, c.measure)}</select>` : esc(VOCAB.measures[c.measure]?.label || c.measure)}</td>
+        <td>${editable ? `<select data-k="condition">${options([['pct_increase_gt', 'month-over-month increase above (%)'], ['value_gt', 'monthly value above']], c.condition)}</select>` : esc(c.condition === 'pct_increase_gt' ? 'month-over-month increase above (%)' : 'monthly value above')}</td>
+        <td>${editable ? `<input type="text" data-k="threshold" value="${esc(c.threshold)}" style="width:110px">` : esc(c.condition === 'pct_increase_gt' ? `${c.threshold}%` : fmt(c.threshold))}</td>
+        ${editable ? `<td>${cur().length > 1 ? '<button class="btn sm bad del">Remove</button>' : ''}</td>` : ''}</tr>`).join('')}
+      </tbody></table>
+      ${editable && cur().length < 4 ? '<button class="btn sm mt" id="addCond">+ Add condition</button>' : ''}
+      <dl class="kv mt"><dt>Source fact</dt><dd class="mono">${esc(fact)}</dd><dt>Assumptions</dt><dd>${(s.assumptions || []).map(esc).join('<br>')}</dd></dl>
+      ${editable ? '<p class="faint">Conditions must use measures from the same fact. Edits take effect after <b>Request changes</b>, which re-runs the back-test.</p>' : ''}`,
+    after: (el) => {
+      const rerender = () => { el.innerHTML = alertTabs(a, editable)[0].html(); alertTabs(a, editable)[0].after(el); };
+      $('#aCombine', el)?.addEventListener('change', (e) => setEdit('combine', e.target.value, s.combine || 'all'));
+      $('#aDim', el)?.addEventListener('change', (e) => setEdit('dimension', e.target.value, s.dimension));
+      $('#aLook', el)?.addEventListener('change', (e) => setEdit('lookback_months', Number(e.target.value) || s.lookback_months, s.lookback_months));
+      el.querySelectorAll('tr[data-i]').forEach((tr) => {
+        const i = Number(tr.dataset.i);
+        tr.querySelectorAll('[data-k]').forEach((inp) => inp.addEventListener('change', () => {
+          const list = structuredClone(cur());
+          list[i][inp.dataset.k] = inp.dataset.k === 'threshold' ? Number(inp.value) : inp.value;
+          setConds(list);
+        }));
+        tr.querySelector('.del')?.addEventListener('click', () => { setConds(cur().filter((_, j) => j !== i)); rerender(); });
+      });
+      $('#addCond', el)?.addEventListener('click', () => { setConds([...structuredClone(cur()), { measure: measureOpts[0][0], condition: 'value_gt', threshold: 100 }]); rerender(); });
+    } },
+    { label: `Back-test (${p.preview.triggered_count} triggers)`, html: () => alertRows(p.preview.rows, conds, s.combine) },
     { label: 'SQL', html: () => `<pre class="sql">${highlightSql(p.sql)}</pre>` },
   ];
 }
 
-function alertRows(allRows) {
+function alertRows(allRows, conds = null, combine = 'all') {
   const rows = [...allRows.filter((r) => r.triggered), ...allRows.filter((r) => !r.triggered)];
   const trig = rows.filter((r) => r.triggered);
-  return `${trig.length ? `<div class="callout warn mb">${trig.length} trigger(s) in the window.</div>` : '<div class="callout ok mb">No triggers in the window.</div>'}
-  <div class="scroll"><table class="t"><thead><tr><th>Month</th><th>Member</th><th class="num">Value</th><th class="num">Previous</th><th class="num">Change %</th><th></th></tr></thead><tbody>
-  ${rows.map((r) => `<tr style="${r.triggered ? 'background:#fff7ed' : ''}"><td>${esc(r.month)}</td><td>${esc(r.member)}</td><td class="num">${fmt(r.value, 'dec')}</td><td class="num">${fmt(r.previous, 'dec')}</td><td class="num">${r.pct_change === null ? '-' : esc(r.pct_change)}</td><td>${r.triggered ? pill('TRIGGERED', 'triggered') : ''}</td></tr>`).join('')}
+  const multi = conds && conds.length > 1 && rows[0] && 'met_1' in rows[0];
+  const cell = (r, i, c) => {
+    const v = r[`value_${i}`], prev = r[`previous_${i}`], pc = r[`pct_change_${i}`];
+    const shown = c.condition === 'pct_increase_gt' ? `${pc === null ? '-' : esc(pc)}%<div class="faint">${fmt(v, 'dec')} vs ${fmt(prev, 'dec')}</div>` : fmt(v, 'dec');
+    return `<td class="num" style="${r[`met_${i}`] ? 'color:var(--red);font-weight:600' : ''}">${shown}</td>`;
+  };
+  return `${trig.length ? `<div class="callout warn mb">${trig.length} trigger(s) in the window${multi ? ` (${combine === 'any' ? 'any' : 'all'} of ${conds.length} conditions)` : ''}.</div>` : '<div class="callout ok mb">No triggers in the window.</div>'}
+  <div class="scroll"><table class="t"><thead><tr><th>Month</th><th>Member</th>${multi ? conds.map((c, i) => `<th class="num">${i + 1}. ${esc(condText(c))}</th>`).join('') : '<th class="num">Value</th><th class="num">Previous</th><th class="num">Change %</th>'}<th></th></tr></thead><tbody>
+  ${rows.map((r) => `<tr style="${r.triggered ? 'background:#fff7ed' : ''}"><td>${esc(r.month)}</td><td>${esc(r.member)}</td>${multi ? conds.map((c, i) => cell(r, i + 1, c)).join('') : `<td class="num">${fmt(r.value, 'dec')}</td><td class="num">${fmt(r.previous, 'dec')}</td><td class="num">${r.pct_change === null ? '-' : esc(r.pct_change)}</td>`}<td>${r.triggered ? pill('TRIGGERED', 'triggered') : ''}</td></tr>`).join('')}
   </tbody></table></div>`;
 }
 
@@ -363,29 +592,71 @@ function alertRows(allRows) {
 function drawDashboard(el, data, spec, opts = {}) {
   const ms = data.measures;
   let current = ms[0].name;
+  const layout = data.layout || spec.layout || 'standard';
+  const chart = data.chart || spec.chart || (data.time ? 'line' : 'bar');
+  const showMain = chart !== 'table' && Boolean(data.time || data.breakdown);
+  const showBreak = layout !== 'executive' && Boolean(data.breakdown) && (Boolean(data.time) || chart === 'table');
+  const showTable = layout !== 'executive' || chart === 'table';
+  const mainIsTime = Boolean(data.time);
   el.innerHTML = `
     <div class="grid ${ms.length >= 4 ? 'g4' : ms.length === 3 ? 'g3' : 'g2'}">${data.kpis.map((k, i) => `<div class="card kpi" style="border-left-color:${SERIES[i]}"><div class="l">${esc(k.label)}</div><div class="v">${fmt(k.value, k.format, true)}</div></div>`).join('')}</div>
-    ${ms.length > 1 ? `<div class="row mt"><span class="muted">Chart measure</span><select id="mSel" style="width:auto">${ms.map((m) => `<option value="${esc(m.name)}">${esc(m.label)}</option>`).join('')}</select></div>` : ''}
-    <div class="grid mt">
-      ${data.time ? `<div class="card"><h2 id="tTitle"></h2><div id="tChart"></div></div>` : ''}
-      ${data.breakdown ? `<div class="card"><h2 id="bTitle"></h2><div id="bChart"></div></div>` : ''}
+    ${ms.length > 1 && (showMain || showBreak) ? `<div class="row mt"><span class="muted">Chart measure</span><select id="mSel" style="width:auto">${ms.map((m) => `<option value="${esc(m.name)}">${esc(m.label)}</option>`).join('')}</select></div>` : ''}
+    <div class="grid mt ${layout === 'scorecard' && showMain && showBreak ? 'g2' : ''}">
+      ${showMain ? '<div class="card"><h2 id="tTitle"></h2><div id="tChart"></div></div>' : ''}
+      ${showBreak ? '<div class="card"><h2 id="bTitle"></h2><div id="bChart"></div></div>' : ''}
     </div>
-    <div class="card mt"><h2>Detail</h2><div class="scroll" style="max-height:${opts.tableHeight || 320}px"><table class="t"><thead><tr>${data.table.columns.map((c) => `<th class="${ms.some((m) => m.name === c) ? 'num' : ''}">${esc(DIM_LABEL[c] || ms.find((m) => m.name === c)?.label || c)}</th>`).join('')}</tr></thead><tbody>
+    ${showTable ? `<div class="card mt"><h2>Detail</h2><div class="scroll" style="max-height:${opts.tableHeight || 320}px"><table class="t"><thead><tr>${data.table.columns.map((c) => `<th class="${ms.some((m) => m.name === c) ? 'num' : ''}">${esc(DIM_LABEL[c] || ms.find((m) => m.name === c)?.label || c)}</th>`).join('')}</tr></thead><tbody>
       ${data.table.rows.map((r) => `<tr>${data.table.columns.map((c) => { const m = ms.find((x) => x.name === c); return `<td class="${m ? 'num' : ''}">${m ? fmt(r[c], m.format) : esc(r[c])}</td>`; }).join('')}</tr>`).join('')}
-    </tbody></table></div></div>`;
+    </tbody></table></div></div>` : ''}`;
   const redraw = () => {
     const m = ms.find((x) => x.name === current);
-    if (data.time) {
+    if (showMain && mainIsTime) {
       $('#tTitle', el).textContent = `${m.label} by ${DIM_LABEL[data.time.dim].toLowerCase()}${data.time.series_dim ? ` and ${DIM_LABEL[data.time.series_dim].toLowerCase()}` : ''}`;
-      lineChart($('#tChart', el), data.time.rows, m);
+      if (chart === 'column' || chart === 'stacked_column') columnChart($('#tChart', el), data.time.rows, m, chart === 'stacked_column');
+      else lineChart($('#tChart', el), data.time.rows, m);
+    } else if (showMain) {
+      $('#tTitle', el).textContent = `${m.label} by ${DIM_LABEL[data.breakdown.dim].toLowerCase()}`;
+      barChart($('#tChart', el), data.breakdown.rows, m);
     }
-    if (data.breakdown) {
+    if (showBreak) {
       $('#bTitle', el).textContent = `${m.label} by ${DIM_LABEL[data.breakdown.dim].toLowerCase()}`;
       barChart($('#bChart', el), data.breakdown.rows, m);
     }
   };
   $('#mSel', el)?.addEventListener('change', (e) => { current = e.target.value; redraw(); });
   redraw();
+}
+
+// Grouped columns per period, or stacked when the measure is additive (stacking ratios would mislead).
+function columnChart(el, rows, m, stackedWanted) {
+  const stacked = stackedWanted && m.kind !== 'derived';
+  const ts = [...new Set(rows.map((r) => r.t))].sort();
+  const totals = {};
+  rows.forEach((r) => { totals[r.s] = (totals[r.s] || 0) + Math.abs(Number(r[m.name]) || 0); });
+  const series = Object.keys(totals).sort((a, b) => totals[b] - totals[a]).slice(0, 8);
+  const val = (t, s) => Number(rows.find((r) => r.t === t && r.s === s)?.[m.name]) || 0;
+  const W = Math.max(el.clientWidth || 640, 360), H = Math.round(Math.min(Math.max(W * 0.36, 240), 340)), L = 62, R = 14, T = 10, B = 30;
+  const peak = stacked ? Math.max(...ts.map((t) => series.reduce((a, s) => a + Math.max(val(t, s), 0), 0)), 0) : Math.max(...ts.flatMap((t) => series.map((s) => val(t, s))), 0);
+  const max = niceMax(peak);
+  const ph = H - T - B;
+  const y = (v) => T + ph - (ph * v) / max;
+  const slot = (W - L - R) / Math.max(ts.length, 1);
+  let svg = '';
+  for (let i = 0; i <= 4; i++) { const yy = y((max * i) / 4); svg += `<line x1="${L}" x2="${W - R}" y1="${yy}" y2="${yy}" stroke="${i ? '#eef1f5' : '#d9dee7'}"/><text x="${L - 8}" y="${yy + 4}" text-anchor="end">${esc(fmt((max * i) / 4, m.format, true))}</text>`; }
+  ts.forEach((t, i) => {
+    const x0 = L + i * slot + slot * 0.14, bw = slot * 0.72;
+    let acc = 0;
+    series.forEach((s, si) => {
+      const v = Math.max(val(t, s), 0);
+      const h = (ph * v) / max;
+      const tip = `<title>${esc(s)} ${esc(t)}: ${esc(fmt(v, m.format))}</title>`;
+      if (stacked) { svg += `<rect x="${x0}" y="${T + ph - acc - h}" width="${bw}" height="${h}" fill="${SERIES[si]}">${tip}</rect>`; acc += h; }
+      else { const gw = bw / series.length; svg += `<rect x="${x0 + si * gw}" y="${T + ph - h}" width="${Math.max(gw - 1, 1)}" height="${h}" rx="1" fill="${SERIES[si]}">${tip}</rect>`; }
+    });
+  });
+  const step = Math.ceil(ts.length / 10);
+  ts.forEach((t, i) => { if (i % step === 0) svg += `<text x="${L + i * slot + slot / 2}" y="${H - 10}" text-anchor="middle">${esc(t)}</text>`; });
+  el.innerHTML = `<div class="legend">${series.map((s, i) => `<span style="--c:${SERIES[i]}">${esc(s)}</span>`).join('')}</div><svg class="chart" viewBox="0 0 ${W} ${H}">${svg}</svg>${stackedWanted && !stacked ? '<div class="faint">Ratios cannot be stacked; shown side by side.</div>' : ''}`;
 }
 
 function niceMax(v) {
@@ -541,7 +812,7 @@ async function renderAlerts() {
   <div class="page-head"><div><h1>Alerts</h1><p>Thin slice of use case 3: plain-English alert rules over Gold facts, approved before activation, evaluated on demand.</p></div><a class="btn primary" href="#/ask">New alert request</a></div>
   ${alerts.length ? alerts.map((a) => `<div class="card" data-id="${esc(a.id)}">
     <div class="row">${pill('alert', a.id)}${pill(a.last_result?.status || '', a.last_result?.status || 'not evaluated')}<b>${esc(a.name)}</b><span class="spacer"></span><span class="faint">evaluated ${when(a.last_evaluated_at)}</span><button class="btn sm eval">Evaluate now</button></div>
-    <div class="mt alert-rows">${a.last_result ? alertRows(a.last_result.rows) : ''}</div></div>`).join('')
+    <div class="mt alert-rows">${a.last_result ? alertRows(a.last_result.rows, a.spec.conditions, a.spec.combine) : ''}</div></div>`).join('')
     : '<div class="card empty">No alerts yet. Try: "Alert me when monthly warranty cost for any product line rises more than 50% month over month".</div>'}`;
   document.querySelectorAll('.eval').forEach((b) => b.addEventListener('click', async (e) => {
     const card = e.target.closest('.card');
@@ -590,4 +861,4 @@ async function renderAbout() {
   });
 }
 
-refreshStatus().then(router);
+refreshStatus().then(async () => { try { VOCAB = await api('/api/vocabulary'); } catch { /* loaded on demand */ } router(); });

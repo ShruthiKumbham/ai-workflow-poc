@@ -2,21 +2,24 @@
 // plain-English requirement -> measures/dimensions/period (AI, constrained to the semantic layer)
 // -> plan: reuse existing Gold facts, build missing Gold facts + measures -> report mart
 // -> dry run (dashboard data, reconciliation to source, DQ) -> reviewer approves -> publish.
-import { all, one, run, q, transaction, runScript, tableExists } from './db.js';
+import { all, one, run, q, lit, transaction, runScript, tableExists } from './db.js';
 import { structured, SYSTEM_PROMPT, engineInfo } from './llm.js';
 import * as rules from './rules.js';
 import { ALL_MEASURES, BASE_MEASURES, DERIVED_MEASURES, DIMENSIONS, FACTS, baseComponents, factsFor, measureSql, fillDates } from './semantic.js';
-import { listCatalog, registerDataset, addLineage, registerMeasure, saveDqResults, saveReport, audit, newId } from './meta.js';
+import { listCatalog, registerDataset, addLineage, registerMeasure, saveDqResults, saveReport, audit, newId, getLayerRules, saveLayerRules } from './meta.js';
 
 export async function dataRange() {
   const r = await one(`SELECT min(order_date)::VARCHAR AS min_d, max(order_date)::VARCHAR AS max_d FROM gold.fct_sales`);
   return { from: r.min_d, to: r.max_d };
 }
 
+export const CHARTS = { line: 'Line', column: 'Column', stacked_column: 'Stacked column', bar: 'Horizontal bar', table: 'Table only' };
+export const LAYOUTS = { standard: 'Standard: KPIs, charts and detail table', executive: 'Executive: KPIs and one chart', scorecard: 'Scorecard: KPIs, breakdown and detail table' };
+
 const SPEC_SCHEMA = {
   type: 'object',
   additionalProperties: false,
-  required: ['title', 'measures', 'dimensions', 'breakdown_dimension', 'date_from', 'date_to', 'chart', 'assumptions'],
+  required: ['title', 'measures', 'dimensions', 'breakdown_dimension', 'date_from', 'date_to', 'chart', 'layout', 'assumptions'],
   properties: {
     title: { type: 'string', description: 'Short report title a business user would recognise' },
     measures: { type: 'array', items: { type: 'string', enum: Object.keys(ALL_MEASURES) }, description: '1-4 measures, most important first' },
@@ -24,10 +27,12 @@ const SPEC_SCHEMA = {
     breakdown_dimension: { type: 'string', enum: ['none', ...Object.keys(DIMENSIONS).filter((d) => !DIMENSIONS[d].time)], description: 'Optional secondary breakdown' },
     date_from: { type: 'string', description: 'YYYY-MM-DD' },
     date_to: { type: 'string', description: 'YYYY-MM-DD' },
-    chart: { type: 'string', enum: ['line', 'bar'] },
+    chart: { type: 'string', enum: Object.keys(CHARTS), description: 'Main visual. line / column / stacked_column need a time dimension; bar is horizontal bars for a category; table shows no chart' },
+    layout: { type: 'string', enum: Object.keys(LAYOUTS), description: 'standard = KPIs + charts + detail table; executive = KPIs + one chart; scorecard = KPIs + breakdown + detail table' },
     assumptions: { type: 'array', items: { type: 'string' } },
   },
 };
+
 
 async function factStatus() {
   const out = {};
@@ -40,14 +45,52 @@ async function factStatus() {
   return out;
 }
 
+async function sourceInfo(d) {
+  const roles = Object.fromEntries(d.columns.filter((c) => c.role).map((c) => [c.role, c.name]));
+  return { dataset: d.dataset, roles, hasHierarchy: d.columns.some((c) => c.name === 'product_line'), rules: await getLayerRules(d.dataset) };
+}
+
 async function findSilverSource(fact) {
   const cat = await listCatalog();
   for (const d of cat) {
     if (d.layer !== 'silver' || d.dataset.endsWith('__quarantine') || !d.tags.includes(fact.sourceTag)) continue;
-    const roles = Object.fromEntries(d.columns.filter((c) => c.role).map((c) => [c.role, c.name]));
-    if (fact.requiresRoles.every((r) => roles[r])) return { dataset: d.dataset, roles, hasHierarchy: d.columns.some((c) => c.name === 'product_line') };
+    const info = await sourceInfo(d);
+    if (fact.requiresRoles.every((r) => info.roles[r])) return info;
   }
   return null;
+}
+
+// Reconciliation recomputes totals from the raw source using the same layer rules the Gold fact
+// was built with (statuses included in Gold, negative amounts quarantined or not).
+function reconContext(factRules) {
+  const r = factRules['gold.fct_warranty_claims'];
+  if (!r) return {};
+  return { warranty: { statuses: r.status_column ? r.gold.include_statuses : undefined, excludeNegative: Boolean(r.silver?.quarantine_negative_amounts) } };
+}
+
+async function factRulesFor(plan, facts) {
+  const out = {};
+  for (const b of plan.build) if (facts[b.fact].source?.rules) out[b.fact] = facts[b.fact].source.rules;
+  for (const f of plan.reuse) { const r = await getLayerRules(f); if (r) out[f] = r; }
+  return out;
+}
+
+// Gold facts already built from a Silver table are rebuilt when that table is re-onboarded,
+// so they pick up the new layer rules.
+export async function rebuildFactsFrom(silverDataset, artifactId) {
+  const edges = await all(`SELECT DISTINCT to_node FROM meta.lineage WHERE from_node = ? AND to_node LIKE 'gold.fct_%'`, [silverDataset]);
+  const cat = await listCatalog();
+  const d = cat.find((x) => x.dataset === silverDataset);
+  const done = [];
+  for (const { to_node: fact } of edges) {
+    if (!FACTS[fact] || !d || !(await tableExists(fact))) continue;
+    const src = await sourceInfo(d);
+    await runScript(factSql(fact, src));
+    await run(`UPDATE meta.catalog SET row_count = (SELECT count(*) FROM ${fact}), registered_at = now() WHERE dataset = ?`, [fact]);
+    if (src.rules) await saveLayerRules(fact, src.rules, artifactId);
+    done.push(fact);
+  }
+  return done;
 }
 
 function specPrompt(text, facts, range) {
@@ -97,7 +140,15 @@ export function validateSpec(spec, range) {
     if (spec.date_from < range.from) { spec.date_from = range.from; }
     if (spec.date_to > range.to) { warnings.push(`Data is only available up to ${range.to}; period truncated.`); spec.date_to = range.to; }
   }
-  spec.chart = spec.dimensions.some((d) => DIMENSIONS[d].time) ? (spec.chart === 'bar' ? 'bar' : 'line') : 'bar';
+  const hasTime = spec.dimensions.some((d) => DIMENSIONS[d].time);
+  const hasSeries = spec.dimensions.some((d) => !DIMENSIONS[d].time);
+  const asked = spec.chart;
+  if (!CHARTS[spec.chart]) spec.chart = hasTime ? 'line' : 'bar';
+  if (hasTime && spec.chart === 'bar') spec.chart = 'column';
+  if (!hasTime && ['line', 'column', 'stacked_column'].includes(spec.chart)) spec.chart = 'bar';
+  if (spec.chart === 'stacked_column' && !hasSeries) spec.chart = 'column';
+  if (CHARTS[asked] && asked !== spec.chart && !(asked === 'bar' && spec.chart === 'column')) warnings.push(`${CHARTS[asked]} chart does not fit this grouping; using ${CHARTS[spec.chart].toLowerCase()}.`);
+  if (!LAYOUTS[spec.layout]) spec.layout = 'standard';
   if (!spec.title) spec.title = spec.measures.map((m) => ALL_MEASURES[m].label).join(', ');
   return { errors, warnings };
 }
@@ -108,7 +159,14 @@ function factSql(factName, src) {
   const col = (role, fallback = 'NULL') => (r[role] ? `w.${q(r[role])}` : fallback);
   const hier = (c) => (src.hasHierarchy ? `coalesce(w.${c}, 'Unmapped')` : `'Unmapped'`);
   if (factName === 'gold.fct_warranty_claims') {
-    return `-- Gold fact (new): one row per accepted warranty claim, conformed to date, product hierarchy and dealer region
+    // Gold inclusion rule agreed at onboarding (default: every status except REJECTED).
+    const lr = src.rules;
+    const statusExpr = `upper(trim(coalesce(${col('status', "''")}, '')))`;
+    const statusWhere = lr?.status_column && r.status
+      ? `${statusExpr} IN (${lr.gold.include_statuses.map(lit).join(', ')})`
+      : `${statusExpr} <> 'REJECTED'`;
+    const statusText = lr?.status_column ? `Gold layer rule from onboarding - include ${lr.gold.include_statuses.join(', ')}` : 'platform default - exclude REJECTED';
+    return `-- Gold fact (new): one row per warranty claim in the included statuses, conformed to date, product hierarchy and dealer region
 CREATE OR REPLACE TABLE gold.fct_warranty_claims AS
 SELECT
   ${col('record_id')} AS claim_id,
@@ -124,13 +182,14 @@ SELECT
   ${col('failure_code')} AS failure_code,
   coalesce(${col('failure_description')}, 'Not specified') AS failure_mode,
   ${col('status')} AS claim_status,
+  -- statuses: ${statusText}
   coalesce(${col('labor_amount', '0')}, 0) AS labor_amount,
   coalesce(${col('parts_amount', '0')}, 0) AS parts_amount,
   coalesce(${col('labor_amount', '0')}, 0) + coalesce(${col('parts_amount', '0')}, 0) AS total_claim_amount
 FROM ${src.dataset} w
 JOIN gold.dim_date dd ON dd.date = ${col('event_date')}
 LEFT JOIN silver.dealers d ON d.dealer_code = ${col('dealer_id')}
-WHERE upper(coalesce(${col('status', "''")}, '')) <> 'REJECTED';`;
+WHERE ${statusWhere};`;
   }
   if (factName === 'gold.fct_quality_inspections') {
     const ts = col('event_timestamp');
@@ -191,7 +250,7 @@ export async function reportData(spec, table) {
   const kpis = ms.map((m) => ({ name: m, label: ALL_MEASURES[m].label, format: ALL_MEASURES[m].format, value: kpiRow[m] }));
   const timeDim = spec.dimensions.find((d) => DIMENSIONS[d].time);
   const catDim = spec.dimensions.find((d) => !DIMENSIONS[d].time);
-  const out = { kpis, measures: ms.map((m) => ({ name: m, label: ALL_MEASURES[m].label, format: ALL_MEASURES[m].format })) };
+  const out = { kpis, chart: spec.chart, layout: spec.layout || 'standard', measures: ms.map((m) => ({ name: m, label: ALL_MEASURES[m].label, format: ALL_MEASURES[m].format, kind: ALL_MEASURES[m].kind })) };
   if (timeDim) {
     out.time = { dim: timeDim, series_dim: catDim || null, rows: await all(`SELECT ${timeDim} AS t, ${catDim ? `${catDim} AS s` : `'Total' AS s`}, ${sel} FROM ${table} GROUP BY ALL ORDER BY 1, 2`) };
   }
@@ -202,18 +261,23 @@ export async function reportData(spec, table) {
   return out;
 }
 
-export async function reconcile(spec, table) {
+export async function reconcile(spec, table, ctx = {}) {
   const bases = [...new Set(spec.measures.flatMap(baseComponents))];
   const lines = [];
   for (const b of bases) {
     const m = BASE_MEASURES[b];
     const report = (await one(`SELECT sum(${b})::DOUBLE AS v FROM ${table}`)).v ?? 0;
     const gold = (await one(`SELECT (${m.expression})::DOUBLE AS v FROM ${m.fact} WHERE ${FACTS[m.fact].dateColumn} BETWEEN DATE '${spec.date_from}' AND DATE '${spec.date_to}'`)).v ?? 0;
-    const source = (await one(fillDates(m.sourceCheck, spec.date_from, spec.date_to))).v ?? 0;
+    const check = typeof m.sourceCheck === 'function' ? m.sourceCheck(ctx) : m.sourceCheck;
+    const source = (await one(fillDates(check, spec.date_from, spec.date_to))).v ?? 0;
     const src = Number(source);
     const tol = m.format === 'int' ? 0 : 0.01;
     const diff = Number(report) - src;
-    lines.push({ measure: b, label: m.label, format: m.format, source: src, gold: Number(gold), report: Number(report), difference: Math.round(diff * 100) / 100, passed: Math.abs(diff) <= tol, rule: m.definition });
+    let rule = m.definition;
+    if (m.fact === 'gold.fct_warranty_claims' && ctx.warranty) {
+      rule += ` Layer rules applied: statuses ${ctx.warranty.statuses ? ctx.warranty.statuses.join(', ') : 'all except REJECTED'}${ctx.warranty.excludeNegative ? '; negative amounts quarantined' : ''}.`;
+    }
+    lines.push({ measure: b, label: m.label, format: m.format, source: src, gold: Number(gold), report: Number(report), difference: Math.round(diff * 100) / 100, passed: Math.abs(diff) <= tol, rule });
   }
   return { tolerance: 'exact for counts, +/- 0.01 for amounts', passed: lines.every((l) => l.passed), lines, period: [spec.date_from, spec.date_to] };
 }
@@ -258,7 +322,11 @@ export async function proposeReport({ requestText }) {
     warnings = v.warnings;
     notes.push({ step: 'Requirement breakdown', engine: 'rules', note: 'Broken down by rule-based glossary matcher.' });
   }
+  return buildReport({ requestText, spec, warnings, notes, engine, facts });
+}
 
+async function buildReport({ requestText, spec, warnings, notes, engine, facts }) {
+  facts ||= await factStatus();
   // Plan: reuse / build / blocked
   const needed = factsFor(spec.measures);
   const plan = { reuse: [], build: [], blocked: [] };
@@ -275,6 +343,8 @@ export async function proposeReport({ requestText }) {
   const allMeasureNames = [...new Set([...spec.measures, ...spec.measures.flatMap(baseComponents)])];
   const measuresNew = allMeasureNames.filter((m) => !registered.has(m)).map((m) => ALL_MEASURES[m]);
   const measuresReused = allMeasureNames.filter((m) => registered.has(m));
+  const factRules = await factRulesFor(plan, facts);
+  const ctx = reconContext(factRules);
 
   let table = `gold.rpt_${slug(spec.title)}`;
   if (await tableExists(table)) table = `${table}_${Math.random().toString(36).slice(2, 6)}`;
@@ -285,28 +355,74 @@ export async function proposeReport({ requestText }) {
     for (const s of Object.values(sql.facts)) await runScript(s);
     await runScript(sql.mart);
     const data = await reportData(spec, table);
-    const reconciliation = await reconcile(spec, table);
+    const reconciliation = await reconcile(spec, table, ctx);
     const checks = await martChecks(table, spec, plan.build.map((b) => b.fact));
     return { data, reconciliation, checks };
   }, { commit: false });
   notes.push({ step: 'Dry run', engine: 'deterministic', note: `Report built in a rolled-back transaction; reconciliation ${preview.reconciliation.passed ? 'passed' : 'FAILED'}.` });
 
-  const summary = `${spec.measures.length} measure(s) x ${[...spec.dimensions, spec.breakdown_dimension].filter((d) => d && d !== 'none').length} dimension(s), ${spec.date_from} .. ${spec.date_to}. Reuses ${plan.reuse.length} Gold table(s), builds ${plan.build.length} new fact(s) + 1 report mart, registers ${measuresNew.length} new measure(s). Reconciliation to source: ${preview.reconciliation.passed ? 'passed' : 'FAILED'}.`;
+  const summary = `${spec.measures.length} measure(s) x ${[...spec.dimensions, spec.breakdown_dimension].filter((d) => d && d !== 'none').length} dimension(s), ${spec.date_from} .. ${spec.date_to}; ${CHARTS[spec.chart].toLowerCase()} chart, ${spec.layout} layout. Reuses ${plan.reuse.length} Gold table(s), builds ${plan.build.length} new fact(s) + 1 report mart, registers ${measuresNew.length} new measure(s). Reconciliation to source: ${preview.reconciliation.passed ? 'passed' : 'FAILED'}.`;
   return {
     blocked: false,
     title: spec.title, summary, engine,
-    payload: { request_text: requestText, spec, warnings, plan, table, sql, measures_new: measuresNew, measures_reused: measuresReused, preview, notes },
+    payload: { request_text: requestText, spec, warnings, plan, table, sql, fact_rules: factRules, measures_new: measuresNew, measures_reused: measuresReused, preview, notes },
   };
+}
+
+const specText = (s) => `${s.measures.join(', ')} by ${[...s.dimensions, s.breakdown_dimension].filter((d) => d && d !== 'none').join(' x ')}; ${s.date_from}..${s.date_to}; ${s.chart} chart; ${s.layout} layout; "${s.title}"`;
+
+export async function reviseReport(payload, { edits = {}, comment = '' }) {
+  const range = await dataRange();
+  const old = payload.spec;
+  if (!old.layout) old.layout = 'standard';
+  let spec = structuredClone(old);
+  const notes = [];
+  let engine = 'rules';
+  let notApplied = [];
+  for (const k of ['chart', 'layout', 'breakdown_dimension', 'date_from', 'date_to', 'title']) if (edits[k] !== undefined && edits[k] !== '') spec[k] = edits[k];
+  if (Array.isArray(edits.measures) && edits.measures.length) spec.measures = edits.measures;
+  if (Array.isArray(edits.dimensions) && edits.dimensions.length) spec.dimensions = edits.dimensions;
+  if (specText(spec) !== specText(old)) notes.push({ step: 'Reviewer edits', engine: 'deterministic', note: specText(spec) });
+
+  if (comment.trim()) {
+    const before = specText(spec);
+    const facts = await factStatus();
+    const ai = await structured({
+      system: SYSTEM_PROMPT,
+      prompt: `A reviewer asked for changes to this report specification.\n\nReviewer comment: "${comment}"\n\nCurrent specification (JSON):\n${JSON.stringify(spec, null, 1)}\n\nReturn the complete revised specification. Change only what the comment asks for.\n\n${specPrompt(payload.request_text, facts, range).split('\n').slice(2).join('\n')}`,
+      schema: SPEC_SCHEMA,
+    });
+    let used = false;
+    if (ai.ok) {
+      const cand = ai.data;
+      const v = validateSpec(cand, range);
+      if (v.errors.length) notes.push({ step: 'Revision', engine: 'claude', note: `Claude revision rejected: ${v.errors.join('; ')}. Used rule engine.` });
+      else { spec = cand; engine = 'claude'; used = true; }
+    } else if (engineInfo().mode === 'claude') notes.push({ step: 'Revision', engine: 'claude', note: `Claude unavailable (${ai.error}); used rule engine.` });
+    if (!used) notApplied = rules.reviseReportFromComment(comment, spec).unrecognised;
+    const after = specText(spec);
+    notes.push({ step: 'Revision', engine, note: `${after !== before ? `From the comment: ${after}` : 'No change could be derived from the comment'}${notApplied.length ? `. Not applied: ${notApplied.join(' | ')}` : ''}.` });
+  }
+  const v = validateSpec(spec, range);
+  if (v.errors.length) throw Object.assign(new Error(`The requested change makes the report invalid: ${v.errors.join('; ')}`), { status: 400 });
+  if (specText(spec) === specText(old)) {
+    throw Object.assign(new Error(`No change could be applied${notApplied.length ? ` (not understood: ${notApplied.join(' | ')})` : ''}. Change the presentation on the review screen, or phrase the comment like "use a stacked column chart", "executive layout", "add average claim cost", "break down by dealer" or "for 2024".`), { status: 400 });
+  }
+  const proposal = await buildReport({ requestText: payload.request_text, spec, warnings: v.warnings, notes, engine });
+  if (proposal.blocked) throw Object.assign(new Error(proposal.message), { status: 400 });
+  return { ...proposal, changes: [`Was: ${specText(old)}`, `Now: ${specText(spec)}`], notApplied };
 }
 
 // ---- deploy ------------------------------------------------------------------
 export async function deployReport(artifact, { reviewer }) {
   const p = artifact.payload;
   const { spec, table, plan } = p;
+  const factRules = { ...(p.fact_rules || {}) };
+  for (const f of plan.reuse) { const r = await getLayerRules(f); if (r) factRules[f] = r; }
   const result = await transaction(async () => {
     for (const s of Object.values(p.sql.facts)) await runScript(s);
     await runScript(p.sql.mart);
-    const reconciliation = await reconcile(spec, table);
+    const reconciliation = await reconcile(spec, table, reconContext(factRules));
     const checks = await martChecks(table, spec, plan.build.map((b) => b.fact));
     const blocking = checks.filter((c) => c.severity === 'error' && !c.passed);
     if (blocking.length) throw new Error(`Blocking checks failed: ${blocking.map((b) => b.name).join('; ')}`);
@@ -320,9 +436,10 @@ export async function deployReport(artifact, { reviewer }) {
   for (const b of plan.build) {
     const f = FACTS[b.fact];
     await registerDataset({ dataset: b.fact, layer: 'gold', title: f.label, description: `Built by the portal from ${b.from} for "${spec.title}".`, owner: reviewer, sourceSystem: b.from.split('.')[1], columns: await cols(b.fact), rowCount: (await one(`SELECT count(*) AS n FROM ${b.fact}`)).n, tags: ['fact', f.subject, 'built by portal'], artifactId: artifact.id, dqStatus: 'passed' });
-    await addLineage(b.from, b.fact, 'fact build', artifact.id);
+    await addLineage(b.from, b.fact, 'fact build (Gold layer rules)', artifact.id);
     await addLineage('gold.dim_date', b.fact, 'join', artifact.id);
     if (b.fact === 'gold.fct_warranty_claims') await addLineage('silver.dealers', b.fact, 'dealer region', artifact.id);
+    if (factRules[b.fact]) await saveLayerRules(b.fact, factRules[b.fact], artifact.id);
   }
   await registerDataset({ dataset: table, layer: 'gold', title: `Report mart: ${spec.title}`, description: `Aggregated at ${[...spec.dimensions, spec.breakdown_dimension].filter((d) => d !== 'none').join(' x ')} for ${spec.date_from}..${spec.date_to}.`, owner: reviewer, sourceSystem: 'derived', columns: await cols(table), rowCount: (await one(`SELECT count(*) AS n FROM ${table}`)).n, tags: ['report mart'], artifactId: artifact.id, dqStatus: result.checks.every((c) => c.passed) ? 'passed' : 'passed with warnings' });
   for (const f of factsFor(spec.measures)) await addLineage(f, table, 'aggregate', artifact.id);

@@ -59,6 +59,20 @@ Things to know:
 4. **Ask → Quality engineer (thin slice):** *"Alert me when monthly warranty cost for any product line rises more than 50% month over month."* Review the back-test, approve, then use **Evaluate now** on the Alerts page.
 5. **Audit trail:** who asked, what was generated, who approved it, and what was deployed.
 
+### Review feedback round (Nov 2026)
+
+Added after the first internal demo:
+
+- **Request changes.** Besides Approve and Reject, the reviewer can write what they want changed ("keep only APPROVED and PAID in silver", "use a stacked column chart", "add a condition: claims exceed 150") and/or edit the proposal on screen (column names, roles, transforms, layer rules, chart, layout, alert conditions). The portal regenerates the proposal as **version 2, 3, ...**, dry-runs it again and keeps the earlier version as *superseded*, with a revision history. With Claude enabled the comment is interpreted by Claude within the same schemas and validators; offline, the rule engine understands common phrasings and lists anything it could not apply.
+- **Bronze / Silver / Gold layer rules**, shown in plain English and editable:
+  - *Bronze:* keep full history (append each load with its batch id), replace on each load, or incremental by date watermark.
+  - *Silver:* which status values to keep (for example only active claims), whether rows with bad dates or negative amounts go to quarantine. Duplicates and older versions are always reduced to the latest load per business key.
+  - *Gold:* which status values Gold facts and reports include (default: everything except REJECTED).
+  - The **Layer preview** tab shows how the rows flow (source → Bronze → Silver / quarantine / excluded → Gold-ready) with sample rows from each layer. Gold facts built from a table are rebuilt when it is re-onboarded with new rules, and **reconciliation applies the same rules** when it recomputes totals from source.
+- **Alerts with several conditions**, combined with AND or OR, for example *"warranty cost rises more than 50% month over month and claims exceed 100"*. The back-test shows each condition per month.
+- **Report presentation:** the requester can ask for a chart type (line, column, stacked column, horizontal bar, table) and a layout (standard, executive, scorecard), or the reviewer can change them. The PDF follows the same choice.
+- **Clearer tabs:** *Schema mapping (columns)* vs *Part mapping (product hierarchy)*, each with a one-line explanation; part mapping only appears when the source has part numbers.
+
 ## Scope coverage
 
 | Scope item | Where it lives |
@@ -72,10 +86,12 @@ Things to know:
 | **UC2** Reuse existing Gold, build missing Gold tables and measures | Plan step: reuse `gold.fct_sales`, build `gold.fct_*` from onboarded Silver by column role, register measures in `meta.measures` |
 | **UC2** In-portal dashboard and one-page PDF | **Reports** page (SVG charts) and `src/pdf.js` (PDFKit, single page, vector chart) |
 | **UC2** Reconcile report totals to source | `reconcile()` recomputes each base measure straight from the source system and compares it with the Gold fact and the report |
-| **UC3** One plain-English alert rule (thin slice) | `src/alerts.js`: rule → SQL over a Gold fact, back-test, approval, evaluate on demand |
+| **UC3** Plain-English alert rule (thin slice) | `src/alerts.js`: one or more conditions (AND / OR) → SQL over a Gold fact, back-test, approval, evaluate on demand |
 | Natural-language intake | `src/workflow.js` `intake()`: classify and route |
 | Single-reviewer approval gate | `decide()`: the dry run happens in a **rolled-back transaction**; approval re-runs **the exact reviewed SQL**, re-checks DQ, and rolls back on any blocking failure |
 | Data quality checks | Onboarding: completeness, key not null and unique, plausible dates, numeric parse, negatives, mapping rate, PII, quarantine rate. Reports: mart not empty, fact grain unique, unmapped share. |
+| Request changes and versions | `revise()` in `src/workflow.js`; `reviseOnboarding` / `reviseReport` / `reviseAlert`; comment parsing in `src/rules.js` |
+| Bronze / Silver / Gold layer rules | `defaultLayerRules`, `validateLayerRules`, `compileOnboarding` in `src/onboarding.js`; stored in `meta.layer_rules` and applied by Gold fact builds and reconciliation |
 | Lineage back to source | `meta.lineage` edges from every deploy; **Lineage** graph from source to Bronze, Silver, Gold and the report, also printed on the PDF |
 
 Out of scope, as agreed: unstructured or file-upload sources, SSO and integration with Allison portals, Power BI publishing, scheduling and distribution (phase 2), streaming, multi-level approvals, cost controls, and production-grade security.

@@ -11,7 +11,7 @@ process.env.POC_DB_PATH = path.join(tmp, 'platform.duckdb');
 
 const llm = await import('../src/llm.js');
 const { seed } = await import('../src/seed.js');
-const { intake, decide } = await import('../src/workflow.js');
+const { intake, decide, revise } = await import('../src/workflow.js');
 const { getArtifact } = await import('../src/meta.js');
 const { close } = await import('../src/db.js');
 
@@ -41,6 +41,11 @@ before(async () => {
       if (/alert/i.test(req)) return { ok: true, data: { intent: 'alert', source_table: 'none', restated_request: 'alert' } };
       return { ok: true, data: { intent: 'report', source_table: 'none', restated_request: 'report' } };
     }
+    if (p.mapping && p.layer_rules) {
+      // Simulated revision: Claude applies the reviewer's comment to the rules and keeps the mapping.
+      const cur = JSON.parse(prompt.match(/Current schema mapping \(JSON\):\n([\s\S]*?)\n\nCurrent layer rules/)[1]);
+      return { ok: true, data: { mapping: cur, layer_rules: { bronze_load_mode: 'replace', silver_keep_statuses: ['APPROVED', 'PAID', 'PENDING'], gold_include_statuses: ['APPROVED', 'PAID'], quarantine_bad_date: true, quarantine_negative_amounts: true }, not_applied: ['notify finance'] } };
+    }
     if (p.columns) {
       const m = structuredClone(GOOD_MAPPING);
       if (mappingMode === 'unhashed') m.columns[10].transform = 'trim';
@@ -49,7 +54,7 @@ before(async () => {
     if (p.measures) {
       return { ok: true, data: { title: 'Warranty claim rate by failure mode', measures: ['claims_per_1000_units', 'claim_count'], dimensions: ['quarter', 'failure_mode'], breakdown_dimension: 'region', date_from: '2025-01-01', date_to: '2025-12-31', chart: 'line', assumptions: ['Simulated.'] } };
     }
-    if (p.condition) return { ok: false, error: 'simulated outage' };
+    if (p.conditions) return { ok: false, error: 'simulated outage' };
     return { ok: false, error: 'unexpected schema' };
   });
   await seed({ quiet: true });
@@ -76,6 +81,19 @@ test('valid Claude mapping is used as-is and compiles to conventions', async () 
   assert.ok(a.payload.preview.checks.every((c) => c.severity !== 'error' || c.passed));
   const d = await decide(r.artifactId, { decision: 'approve', reviewer: 'tester' });
   assert.equal(d.status, 'deployed');
+});
+
+test('Claude applies a reviewer comment as a new version, checked by the same validators', async () => {
+  const r = await intake({ text: 'Please onboard the warranty claims' });
+  const v = await revise(r.artifactId, { reviewer: 'tester', comment: 'Drop rejected claims in silver, only approved and paid in gold, quarantine negatives, no bronze history, and notify finance' });
+  assert.equal(v.version, 2);
+  const a = await getArtifact(v.artifactId);
+  assert.match(a.engine, /^Claude/);
+  assert.deepEqual(a.payload.layer_rules.silver.keep_statuses, ['APPROVED', 'PAID', 'PENDING']);
+  assert.equal(a.payload.layer_rules.bronze.load_mode, 'replace');
+  assert.deepEqual(a.payload.revision.not_applied, ['notify finance']);
+  assert.ok(a.payload.preview.quarantineReasons.some((q) => /negative/.test(q.reject_reason)));
+  await decide(v.artifactId, { decision: 'reject', reviewer: 'tester', comment: 'test only' });
 });
 
 test('Claude spec with a dimension the facts cannot support is corrected with a warning', async () => {
